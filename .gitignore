@@ -17,3 +17,5 @@ packages/db/generated/
 # helper-local agentwiki artifacts (not part of the source repo)
 .agentwiki/
 **/.agentwiki/
+# database backups (local only — never commit)
+backups/

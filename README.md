@@ -183,6 +183,8 @@ pnpm db:up         # start Postgres locally
 
 Architecture decisions and their *why* live in [`MEMORY.md`](./MEMORY.md); repo working rules are in [`CLAUDE.md`](./CLAUDE.md).
 
+→ Backup / restore, decay modes, daemon env vars, and production hardening: [`docs/OPERATIONS.md`](./docs/OPERATIONS.md).
+
 ## Contributing
 
 Issues and PRs are welcome. Keep the architectural invariants intact: no raw transcripts, embeddings behind the `Embedder` interface, the LLM off the critical path, and Postgres as the single source of truth. See [`CLAUDE.md`](./CLAUDE.md).

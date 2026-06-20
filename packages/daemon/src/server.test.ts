@@ -535,6 +535,149 @@ describe("POST /ingest → 202 Accepted", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Suite: GET /metrics
+// ---------------------------------------------------------------------------
+
+describe("GET /metrics — shape", () => {
+  let pool: Pool;
+  let app: Awaited<ReturnType<typeof createApp>>;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    app = await createApp(pool, embedder, cfg);
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end().catch(() => undefined);
+  });
+
+  it("returns 200 with expected MetricsPayload shape", async () => {
+    // Fire a request first so at least one route entry appears
+    await app.inject({ method: "GET", url: "/health" });
+
+    const res = await app.inject({ method: "GET", url: "/metrics" });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as {
+      uptimeSec: number;
+      totalRequests: number;
+      routes: Record<string, { count: number; avgMs: number }>;
+      embedder: { ready: boolean };
+      db: { connected: boolean };
+    };
+    expect(typeof body.uptimeSec).toBe("number");
+    expect(body.uptimeSec).toBeGreaterThanOrEqual(0);
+    expect(typeof body.totalRequests).toBe("number");
+    expect(body.totalRequests).toBeGreaterThan(0);
+    expect(typeof body.routes).toBe("object");
+    expect(body.embedder.ready).toBe(true);
+    expect(typeof body.db.connected).toBe("boolean");
+  });
+
+  it("tracks route counts — repeated /health calls accumulate", async () => {
+    // Hit /health twice more so the route appears with count ≥ 2
+    await app.inject({ method: "GET", url: "/health" });
+    await app.inject({ method: "GET", url: "/health" });
+
+    const res = await app.inject({ method: "GET", url: "/metrics" });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as {
+      routes: Record<string, { count: number; avgMs: number }>;
+    };
+    const healthRoute = body.routes["GET /health"];
+    expect(healthRoute).toBeDefined();
+    expect(typeof healthRoute?.count).toBe("number");
+    expect(healthRoute?.count).toBeGreaterThanOrEqual(2);
+    expect(typeof healthRoute?.avgMs).toBe("number");
+  });
+});
+
+describe("GET /metrics — auth when auth enabled", () => {
+  let pool: Pool;
+  let appWithAuth: Awaited<ReturnType<typeof createApp>>;
+  const TOKEN = "test-secret-token-dolores-99999";
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    appWithAuth = await createApp(pool, embedder, { ...cfg, authToken: TOKEN });
+    await appWithAuth.ready();
+  });
+
+  afterAll(async () => {
+    await appWithAuth.close();
+    await pool.end().catch(() => undefined);
+  });
+
+  it("GET /metrics without token returns 401 UNAUTHORIZED", async () => {
+    const res = await appWithAuth.inject({ method: "GET", url: "/metrics" });
+    expect(res.statusCode).toBe(401);
+    const body = JSON.parse(res.body) as { error: { code: string } };
+    expect(body.error.code).toBe("UNAUTHORIZED");
+  });
+
+  it("GET /metrics with correct token returns 200", async () => {
+    const res = await appWithAuth.inject({
+      method: "GET",
+      url: "/metrics",
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as { uptimeSec: number };
+    expect(typeof body.uptimeSec).toBe("number");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: DOLORES_LOG_LEVEL env controls pino log level
+// ---------------------------------------------------------------------------
+
+describe("DOLORES_LOG_LEVEL env controls log level", () => {
+  it("app.log.level reflects DOLORES_LOG_LEVEL=debug", async () => {
+    const prev = process.env.DOLORES_LOG_LEVEL;
+    process.env.DOLORES_LOG_LEVEL = "debug";
+    let app: Awaited<ReturnType<typeof createApp>> | undefined;
+    const pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    try {
+      const embedder = new NoOpEmbedder();
+      await embedder.ready();
+      app = await createApp(pool, embedder, cfg);
+      await app.ready();
+      expect(app.log.level).toBe("debug");
+    } finally {
+      // biome-ignore lint/performance/noDelete: process.env needs delete to truly unset (= undefined sets the string "undefined")
+      if (prev === undefined) delete process.env.DOLORES_LOG_LEVEL;
+      else process.env.DOLORES_LOG_LEVEL = prev;
+      await app?.close();
+      await pool.end().catch(() => undefined);
+    }
+  });
+
+  it("app.log.level defaults to info when DOLORES_LOG_LEVEL unset", async () => {
+    const prev = process.env.DOLORES_LOG_LEVEL;
+    // biome-ignore lint/performance/noDelete: process.env needs delete to truly unset (= undefined sets the string "undefined")
+    delete process.env.DOLORES_LOG_LEVEL;
+    let app: Awaited<ReturnType<typeof createApp>> | undefined;
+    const pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    try {
+      const embedder = new NoOpEmbedder();
+      await embedder.ready();
+      app = await createApp(pool, embedder, cfg);
+      await app.ready();
+      expect(app.log.level).toBe("info");
+    } finally {
+      if (prev !== undefined) process.env.DOLORES_LOG_LEVEL = prev;
+      await app?.close();
+      await pool.end().catch(() => undefined);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Suite: safety gate — non-localhost host without DOLORES_AUTH_TOKEN
 // ---------------------------------------------------------------------------
 

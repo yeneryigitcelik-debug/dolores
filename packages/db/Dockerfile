@@ -1,4 +1,4 @@
-FROM postgres:17
+FROM postgres:17.2-bookworm
 
 # Install pgvector and pg_cron from PGDG apt repository
 # The official postgres image ships with the PGDG apt source configured

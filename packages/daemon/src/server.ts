@@ -128,6 +128,26 @@ async function runPrune(
 }
 
 // ---------------------------------------------------------------------------
+// In-memory metrics
+// ---------------------------------------------------------------------------
+
+interface RouteMetric {
+  count: number;
+  totalMs: number;
+}
+
+// Local-only type — NOT added to @dolores/core/types.ts.
+// [CONTRACT] If a client-facing MetricsResponse is ever needed across packages,
+// add it to @dolores/core DAEMON_ROUTES and types.ts then import here.
+interface MetricsPayload {
+  uptimeSec: number;
+  totalRequests: number;
+  routes: Record<string, { count: number; avgMs: number }>;
+  embedder: { ready: boolean };
+  db: { connected: boolean };
+}
+
+// ---------------------------------------------------------------------------
 // App factory (testable without binding to a port)
 // ---------------------------------------------------------------------------
 
@@ -139,17 +159,37 @@ export async function createApp(
   // Retrieval/recall/remember still use `pool` (app user + RLS).
   adminPool?: Pool,
 ): Promise<FastifyInstance> {
-  const app = Fastify({ logger: false });
+  const logLevel = process.env.DOLORES_LOG_LEVEL ?? "info";
+  const app = Fastify({ logger: { level: logLevel } });
+
+  // ---------- Metrics state ----------
+  const metricsStartedAt = Date.now();
+  let metricsTotal = 0;
+  const metricsRoutes = new Map<string, RouteMetric>();
+
+  // Collect request count + latency for /metrics.
+  // Fastify's own pino logger already handles access logs automatically;
+  // this hook is for in-memory aggregation only.
+  app.addHook("onResponse", (request, reply, done) => {
+    metricsTotal++;
+    const routeKey = `${request.method} ${request.routeOptions.url}`;
+    const ms = reply.elapsedTime;
+    const slot = metricsRoutes.get(routeKey) ?? { count: 0, totalMs: 0 };
+    slot.count++;
+    slot.totalMs += ms;
+    metricsRoutes.set(routeKey, slot);
+    done();
+  });
 
   // ---------- Global error handler ----------
-  app.setErrorHandler(async (error: FastifyError, _req, reply) => {
+  app.setErrorHandler(async (error: FastifyError, request, reply) => {
     // JSON parse errors and other client-side errors (4xx)
     if ((error.statusCode ?? 500) < 500) {
       return reply
         .status(error.statusCode ?? 400)
         .send({ error: { code: "VALIDATION_ERROR", message: error.message } });
     }
-    console.error("[dolores-daemon] unhandled error:", error.message);
+    request.log.error({ err: error }, "daemon unhandled error");
     return reply
       .status(500)
       .send({ error: { code: "INTERNAL", message: "An internal error occurred" } });
@@ -242,7 +282,7 @@ export async function createApp(
     try {
       return await remember(pool, ctx, embedder, { content, scope, importance, source });
     } catch (err) {
-      console.error("[dolores-daemon] /remember error:", errMsg(err));
+      request.log.error({ err }, "/remember error");
       return reply.status(500).send({
         error: { code: "INTERNAL", message: "An internal error occurred" },
       });
@@ -266,7 +306,7 @@ export async function createApp(
     try {
       return await recall(pool, ctx, embedder, { query, limit, scope, minImportance });
     } catch (err) {
-      console.error("[dolores-daemon] /recall error:", errMsg(err));
+      request.log.error({ err }, "/recall error");
       return reply.status(500).send({
         error: { code: "INTERNAL", message: "An internal error occurred" },
       });
@@ -293,7 +333,7 @@ export async function createApp(
       const result = await buildContext(pool, ctx, maxTokens, query, embedder);
       return { text: result.text, tokenEstimate: result.tokenEstimate };
     } catch (err) {
-      console.error("[dolores-daemon] /context error:", errMsg(err));
+      request.log.error({ err }, "/context error");
       return reply.status(500).send({
         error: { code: "INTERNAL", message: "An internal error occurred" },
       });
@@ -318,7 +358,7 @@ export async function createApp(
       const facts = await listFacts(pool, ctx, category);
       return { facts };
     } catch (err) {
-      console.error("[dolores-daemon] /facts/list error:", errMsg(err));
+      request.log.error({ err }, "/facts/list error");
       return reply.status(500).send({
         error: { code: "INTERNAL", message: "An internal error occurred" },
       });
@@ -343,7 +383,7 @@ export async function createApp(
       const fact = await upsertFact(pool, ctx, { category, key, value, scope });
       return { fact };
     } catch (err) {
-      console.error("[dolores-daemon] /facts/upsert error:", errMsg(err));
+      request.log.error({ err }, "/facts/upsert error");
       return reply.status(500).send({
         error: { code: "INTERNAL", message: "An internal error occurred" },
       });
@@ -371,7 +411,7 @@ export async function createApp(
       enabled: config.extractionEnabled,
       source,
     }).catch((err: unknown) => {
-      console.error("[dolores-daemon] ingest background error:", errMsg(err));
+      app.log.error({ err }, "ingest background error");
     });
 
     return reply.status(202).send({ queued: true });
@@ -395,11 +435,47 @@ export async function createApp(
       const { softened, deleted } = await runPrune(pool, ctx, config.decayMode, dryRun);
       return { deleted, softened, dryRun };
     } catch (err) {
-      console.error("[dolores-daemon] /prune error:", errMsg(err));
+      request.log.error({ err }, "/prune error");
       return reply.status(500).send({
         error: { code: "INTERNAL", message: "An internal error occurred" },
       });
     }
+  });
+
+  // ---------- GET /metrics ----------
+  // Auth-protected when auth is enabled (onRequest hook covers all non-/health routes).
+  app.get("/metrics", async (): Promise<MetricsPayload> => {
+    const uptimeSec = Math.floor((Date.now() - metricsStartedAt) / 1000);
+
+    // Quick connectivity probe — same pattern as /status.
+    let dbConnected = false;
+    try {
+      const client = await pool.connect();
+      try {
+        await client.query("SELECT 1");
+        dbConnected = true;
+      } finally {
+        client.release();
+      }
+    } catch {
+      // pool unreachable — report false, don't throw
+    }
+
+    const routes: MetricsPayload["routes"] = {};
+    for (const [route, m] of metricsRoutes) {
+      routes[route] = {
+        count: m.count,
+        avgMs: m.count > 0 ? Math.round(m.totalMs / m.count) : 0,
+      };
+    }
+
+    return {
+      uptimeSec,
+      totalRequests: metricsTotal,
+      routes,
+      embedder: { ready: true },
+      db: { connected: dbConnected },
+    };
   });
 
   return app;
@@ -411,10 +487,6 @@ export async function createApp(
 
 export async function startDaemon(config: DaemonRuntimeConfig): Promise<void> {
   const embedder = createEmbedder(config.embedder, config.embedModel);
-
-  console.log(`[dolores-daemon] loading embedder ${embedder.id}...`);
-  await embedder.ready();
-  console.log(`[dolores-daemon] embedder ready (dim=${embedder.dim})`);
 
   const pool = new Pool({
     connectionString: config.databaseUrl,
@@ -429,12 +501,22 @@ export async function startDaemon(config: DaemonRuntimeConfig): Promise<void> {
     ? new Pool({ connectionString: adminUrl, max: 3, idleTimeoutMillis: 30_000 })
     : undefined;
 
+  // Create app before embedder.ready() so app.log is available for startup
+  // messages. Route handlers only execute after app.listen() returns, by which
+  // time embedder.ready() has completed.
   const app = await createApp(pool, embedder, config, adminPool);
+
+  app.log.info({ embedderId: embedder.id }, "loading embedder");
+  await embedder.ready();
+  app.log.info({ dim: embedder.dim }, "embedder ready");
 
   setupGracefulShutdown(app, pool, embedder, adminPool);
 
   await app.listen({ port: config.port, host: config.host });
-  console.log(`[dolores-daemon] listening on ${config.host}:${config.port}`);
+  app.log.info(
+    { host: config.host, port: config.port },
+    `listening on ${config.host}:${config.port}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -462,12 +544,12 @@ function setupGracefulShutdown(
     if (stopping) return;
     stopping = true;
 
-    console.log(`[dolores-daemon] ${signal} → graceful shutdown…`);
+    app.log.info({ signal }, `${signal} → graceful shutdown…`);
 
     // Safety valve: if drain genuinely hangs (>30 s), force-exit as a last
     // resort. unref() so it never keeps the loop alive on the happy path.
     const timer = setTimeout(() => {
-      console.error("[dolores-daemon] shutdown timed out, forcing exit");
+      app.log.error("shutdown timed out, forcing exit");
       process.exit(1);
     }, 30_000);
     timer.unref();
@@ -485,7 +567,7 @@ function setupGracefulShutdown(
         if (adminPool) await adminPool.end();
 
         clearTimeout(timer);
-        console.log("[dolores-daemon] shutdown complete");
+        app.log.info("shutdown complete");
 
         // Do NOT call process.exit() here. process.exit() force-runs
         // onnxruntime-node's native static destructors while its global thread
@@ -497,7 +579,7 @@ function setupGracefulShutdown(
         process.exitCode = 0;
       } catch (err) {
         clearTimeout(timer);
-        console.error("[dolores-daemon] shutdown error:", errMsg(err));
+        app.log.error({ err }, "shutdown error");
         process.exitCode = 1;
         // Abnormal path: force exit so a wedged shutdown can't hang forever.
         process.exit(1);
@@ -507,12 +589,4 @@ function setupGracefulShutdown(
 
   process.on("SIGTERM", () => stop("SIGTERM"));
   process.on("SIGINT", () => stop("SIGINT"));
-}
-
-// ---------------------------------------------------------------------------
-// Util
-// ---------------------------------------------------------------------------
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
