@@ -39,7 +39,7 @@
   },
   "dependencies": {
     "@dolores/core": "workspace:*",
-    "@dolores/db": "workspace:*",
+    "fastembed": "^1.14.1",
     "fastify": "^5.2.0",
     "pg": "^8.13.1",
     "pino": "^10.3.1",

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "dolores": {
+      "command": "npx",
+      "args": ["-y", "@dolores/mcp"],
+      "env": {
+        "DOLORES_WORKSPACE_ID": "00000000-0000-0000-0000-000000000001",
+        "DOLORES_DAEMON_PORT": "4505"
+      }
+    }
+  }
+}

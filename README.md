@@ -171,6 +171,10 @@ TypeScript (strict) · Node ESM · pnpm monorepo · Prisma + raw SQL for pgvecto
 | `@dolores/cli` | `commander`-based thin client |
 | `@dolores/mcp` | MCP server (`remember` / `recall`) |
 
+## Examples
+
+Runnable integration examples (MCP wiring, context injection, Node.js SDK): **[`examples/`](./examples/README.md)**
+
 ## Development
 
 ```bash

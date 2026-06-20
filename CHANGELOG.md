@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-20
+
+### Added
+- **Anthropic/Claude extraction provider** — the intended default for Claude
+  subscribers; `createLlmProviderFromEnv` auto-selects anthropic/openai/none.
+- **Query-aware context**: `dolores context "<task>"` fills the blob with the most
+  RELEVANT memories (hybrid recall) instead of just important/recent ones.
+- Optional **bearer auth** (`DOLORES_AUTH_TOKEN`) + a startup safety gate that
+  refuses to start on a non-localhost bind without a token.
+- **`/metrics`** endpoint (auth-protected) and structured logging (pino,
+  `DOLORES_LOG_LEVEL`).
+- **DB backup/restore** (`scripts/backup.sh`, `scripts/restore.sh`) +
+  `docs/OPERATIONS.md` runbook.
+- **Reproducible benchmarks** (`pnpm bench`): token savings (72–98%) and recall@k
+  (hybrid 87% vs full-text 33%) — summarized in the README.
+- `examples/` — Claude Code MCP, agent-context pipe, Node SDK.
+- ivfflat probe tuning (`DOLORES_IVFFLAT_PROBES`) and an importance/recency boost
+  on the retrieval score.
+
+### Changed
+- **Memory decay now works**: `pg_cron` runs via SECURITY DEFINER functions —
+  previously a silent no-op under FORCE RLS (the scheduler saw zero rows).
+- `dolores_app` password from `DOLORES_APP_PASSWORD` (no longer hardcoded).
+- Daemon: body-length limits and redacted error responses (`{error:{code,message}}`).
+- **fastembed** is now an optional peer dependency of `@dolores/core` and a direct
+  dependency of the daemon — `@dolores/mcp` and `@dolores/cli` no longer pull the
+  ~80MB ONNX runtime.
+- `prune` requires `--confirm` (no silent data loss).
+- Pinned base image `postgres:17.2-bookworm`; CI least-privilege permissions.
+
+### Fixed
+- `remember()` dedup race (advisory lock + explicit tenant filter).
+- N+1 in ingest (single batch embed + batch fact upsert).
+- Missing composite ranking index, `fillfactor=80`, RLS `WITH CHECK`, and
+  transactional migrations.
+
 ## [0.1.0] - 2026-06-20
 
 ### Added

@@ -42,12 +42,19 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "fastembed": "^1.14.1",
     "pg": "^8.13.1",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/pg": "^8.11.10"
+  },
+  "peerDependencies": {
+    "fastembed": "^1.14.1"
+  },
+  "peerDependenciesMeta": {
+    "fastembed": {
+      "optional": true
+    }
   },
   "optionalDependencies": {
     "@anthropic-ai/sdk": "^0.105.0",

@@ -74,9 +74,9 @@ importers:
       '@dolores/core':
         specifier: workspace:*
         version: link:../core
-      '@dolores/db':
-        specifier: workspace:*
-        version: link:../db
+      fastembed:
+        specifier: ^1.14.1
+        version: 1.14.4
       fastify:
         specifier: ^5.2.0
         version: 5.8.5

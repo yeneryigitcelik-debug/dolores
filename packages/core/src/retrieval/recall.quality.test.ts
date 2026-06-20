@@ -142,6 +142,14 @@ liveDescribe("retrieval quality (live DB)", () => {
       importance: 10,
     });
 
+    // Equalize recency (both rows get the same last_accessed/created_at) so this
+    // test isolates the IMPORTANCE boost — without this, HIGH being inserted last
+    // gives it a recency edge too, making the assertion non-deterministic.
+    await admin.query(
+      "UPDATE memories SET last_accessed = now(), created_at = now() WHERE workspace_id = $1",
+      [BOOST_WS],
+    );
+
     const { hits } = await recall(pool, ctx, embedder, { query: "zeta probe lookup token" });
 
     expect(hits).toHaveLength(2);
