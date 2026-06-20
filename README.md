@@ -27,6 +27,32 @@ The common approach to agent memory — dump everything into a Markdown file and
 
 The only thing you pay for is the LLM subscription you already have (Claude Pro/Max, etc.). Embeddings run locally and for free. Your data never leaves your infrastructure.
 
+## Benchmarks
+
+Real numbers produced against a local Postgres + bge-small-en-v1.5 (384d CPU).
+
+### Token savings (naive dump vs. dolores `buildContext`)
+
+| Memory store size | Naive tokens | dolores tokens | Savings |
+|-------------------|-------------|----------------|---------|
+| 100 memories      | 2,049       | 582            | **72%** |
+| 500 memories      | 10,251      | 591            | **94%** |
+| 1,000 memories    | 20,502      | 591            | **97%** |
+| 1,500 memories    | 30,768      | 591            | **98%** |
+
+dolores context stays flat at ~591 tokens regardless of store size. The saving grows from 72% at 100 memories to **98% at 1,500**.
+
+### Recall quality (200-memory corpus, 30 queries)
+
+| Retriever                      | hit@1  | hit@3  | hit@5  |
+|-------------------------------|--------|--------|--------|
+| Hybrid (pgvector + full-text)  | **87%** | **87%** | **87%** |
+| Full-text only (baseline)      | 33%    | 33%    | 33%    |
+
+Hybrid retrieval is **2.6× better than full-text alone**. Full-text handles exact keyword matches (100%) but is blind to paraphrase and semantic queries — those score 0% without vectors.
+
+→ Full methodology, ASCII bar chart, and raw data: [`benchmarks/RESULTS.md`](./benchmarks/RESULTS.md)
+
 ## Features
 
 - 🧠 **Two memory kinds** — structured **facts** (deterministic key/value, exact SQL) and semantic **memories** (free text, vector similarity).
