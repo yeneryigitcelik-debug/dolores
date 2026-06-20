@@ -1,0 +1,19 @@
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+*.log
+.env
+.env.local
+.env.*.local
+.DS_Store
+pgdata/
+.dolores/
+packages/db/generated/
+# embedding model cache (downloaded at runtime — never commit, ~100MB+)
+.dolores-models/
+**/.dolores-models/
+# helper-local agentwiki artifacts (not part of the source repo)
+.agentwiki/
+**/.agentwiki/

@@ -1,0 +1,51 @@
+// dolores database schema — Postgres + pgvector + pg_cron.
+//
+// NOTE: VECTOR(384) and TSVECTOR columns and their ivfflat/gin indexes, the RLS
+// policies, and the pg_cron decay jobs are NOT expressible in Prisma's schema.
+// They are applied via a raw-SQL migration in prisma/migrations/ (see the db
+// helper's migration). Prisma owns the base columns; raw SQL owns the rest.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [vector, pg_cron]
+}
+
+/// Structured, deterministic key-value memory. Upserted on (workspace,user,category,key).
+model Fact {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String   @map("workspace_id") @db.Uuid
+  userId      String?  @map("user_id") @db.Uuid
+  scope       String   @default("personal")
+  category    String
+  key         String
+  value       String
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@unique([workspaceId, userId, category, key])
+  @@index([workspaceId, scope])
+  @@map("facts")
+}
+
+/// Semantic memory: free text retrieved by pgvector similarity (+ full-text hybrid).
+/// `embedding VECTOR(384)` and `content_tsv TSVECTOR` are added via raw SQL migration.
+model Memory {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId  String   @map("workspace_id") @db.Uuid
+  userId       String?  @map("user_id") @db.Uuid
+  scope        String   @default("personal")
+  content      String
+  importance   Int      @default(5) @db.SmallInt
+  source       String?
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  lastAccessed DateTime @default(now()) @map("last_accessed") @db.Timestamptz
+
+  @@index([workspaceId, scope])
+  @@map("memories")
+}

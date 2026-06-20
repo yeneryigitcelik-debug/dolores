@@ -1,0 +1,19 @@
+{
+  "name": "@dolores/mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "dolores-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@dolores/core": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.13.0",
+    "zod": "^3.24.1"
+  }
+}

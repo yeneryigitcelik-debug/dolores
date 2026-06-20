@@ -1,0 +1,33 @@
+# dolores local stack: Postgres + pgvector + pg_cron.
+# The image is built from packages/db/Dockerfile (base postgres + pgvector + pg_cron).
+# pg_cron MUST be in shared_preload_libraries, hence the `command` overrides below.
+services:
+  db:
+    build:
+      context: ./packages/db
+      dockerfile: Dockerfile
+    image: dolores-postgres:local
+    container_name: dolores-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-dolores}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dolores}
+      POSTGRES_DB: ${POSTGRES_DB:-dolores}
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_preload_libraries=pg_cron"
+      - "-c"
+      - "cron.database_name=${POSTGRES_DB:-dolores}"
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dolores} -d ${POSTGRES_DB:-dolores}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  pgdata:
