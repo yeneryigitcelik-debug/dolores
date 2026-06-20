@@ -32,14 +32,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Cache the fastembed ONNX model (~22 MB) to avoid re-downloading on every run.
-      # The key is stable — bge-small-en-v1.5 never changes for a given model name.
-      - name: Cache fastembed model
-        uses: actions/cache@v4
-        with:
-          path: /home/runner/.dolores-models
-          key: fastembed-bge-small-en-v1.5
-
       # GitHub Actions service containers cannot build from a custom Dockerfile,
       # so we use `docker compose up --build` to get the pg_cron-enabled image.
       - name: Start Postgres (with pgvector + pg_cron)
