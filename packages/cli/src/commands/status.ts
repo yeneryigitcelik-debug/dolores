@@ -9,7 +9,7 @@ export async function runStatus(): Promise<void> {
     const res = await daemonGet<StatusResponse>(config, "/status");
 
     const dbStatus = res.db.connected ? "✓ bağlı" : "✗ bağlantı yok";
-    const decayLabel = res.decayMode === "aggressive" ? "⚡ aggressive" : "🌿 conservative";
+    const decayLabel = res.decayMode === "aggressive" ? "⚡ agresif" : "🌿 ılımlı";
 
     console.log("\ndolores daemon durumu\n");
     console.log(`  Daemon:              ${daemonBaseUrl(config)}`);

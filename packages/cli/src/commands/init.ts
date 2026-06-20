@@ -30,6 +30,9 @@ export async function runInit(opts: { noDocker: boolean }): Promise<void> {
     if (decayMode !== "aggressive") {
       console.log("  Agresif decay için: DOLORES_DECAY_MODE=aggressive dolores init");
     }
+    console.log("\nSıradaki adımlar:");
+    console.log('  dolores remember "ilk belleğim"');
+    console.log("  dolores status");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`\nMigrasyon hatası: ${msg}`);

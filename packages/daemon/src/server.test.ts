@@ -1,6 +1,7 @@
 import { type DaemonConfig, NoOpEmbedder, type PruneResponse } from "@dolores/core";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { loadConfig } from "./config.js";
 import { createApp } from "./server.js";
 
 // ---------------------------------------------------------------------------
@@ -287,5 +288,321 @@ describe.skipIf(!HAS_DB)("POST /prune — aggressive mode", () => {
     expect(typeof body.softened).toBe("number");
     expect(body.deleted).toBeGreaterThanOrEqual(0);
     expect(body.softened).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: body length limits → 400 VALIDATION_ERROR
+// ---------------------------------------------------------------------------
+
+describe("Body size limits", () => {
+  let pool: Pool;
+  let app: Awaited<ReturnType<typeof createApp>>;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    app = await createApp(pool, embedder, cfg);
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end().catch(() => undefined);
+  });
+
+  it("POST /remember with content > 50_000 chars returns 400 VALIDATION_ERROR", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/remember",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        content: "x".repeat(50_001),
+      }),
+    });
+    expect(res.statusCode).toBe(400);
+    const body = JSON.parse(res.body) as { error: { code: string } };
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("POST /recall with query > 2_000 chars returns 400 VALIDATION_ERROR", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/recall",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        query: "x".repeat(2_001),
+      }),
+    });
+    expect(res.statusCode).toBe(400);
+    const body = JSON.parse(res.body) as { error: { code: string } };
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+  });
+
+  it("POST /ingest with text > 100_000 chars returns 400 VALIDATION_ERROR", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/ingest",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        text: "x".repeat(100_001),
+      }),
+    });
+    expect(res.statusCode).toBe(400);
+    const body = JSON.parse(res.body) as { error: { code: string } };
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: Bearer auth middleware
+// ---------------------------------------------------------------------------
+
+describe("Bearer auth middleware", () => {
+  let pool: Pool;
+  let appWithAuth: Awaited<ReturnType<typeof createApp>>;
+  const TOKEN = "test-secret-token-dolores-12345";
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    appWithAuth = await createApp(pool, embedder, { ...cfg, authToken: TOKEN });
+    await appWithAuth.ready();
+  });
+
+  afterAll(async () => {
+    await appWithAuth.close();
+    await pool.end().catch(() => undefined);
+  });
+
+  it("GET /health is accessible without token even when auth is enabled", async () => {
+    const res = await appWithAuth.inject({ method: "GET", url: "/health" });
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ ok: true });
+  });
+
+  it("POST /recall without Authorization header returns 401 UNAUTHORIZED", async () => {
+    const res = await appWithAuth.inject({
+      method: "POST",
+      url: "/recall",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: TEST_WORKSPACE_ID, userId: TEST_USER_ID, query: "test" }),
+    });
+    expect(res.statusCode).toBe(401);
+    const body = JSON.parse(res.body) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("UNAUTHORIZED");
+    expect(typeof body.error.message).toBe("string");
+  });
+
+  it("POST /recall with wrong token returns 401 UNAUTHORIZED", async () => {
+    const res = await appWithAuth.inject({
+      method: "POST",
+      url: "/recall",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer wrong-token",
+      },
+      body: JSON.stringify({ workspaceId: TEST_WORKSPACE_ID, userId: TEST_USER_ID, query: "test" }),
+    });
+    expect(res.statusCode).toBe(401);
+    const body = JSON.parse(res.body) as { error: { code: string } };
+    expect(body.error.code).toBe("UNAUTHORIZED");
+  });
+
+  it("POST /recall with correct token passes auth (not 401)", async () => {
+    const res = await appWithAuth.inject({
+      method: "POST",
+      url: "/recall",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${TOKEN}`,
+      },
+      body: JSON.stringify({ workspaceId: TEST_WORKSPACE_ID, userId: TEST_USER_ID, query: "test" }),
+    });
+    // Auth passes; DB unreachable → 500 is acceptable, 401 is not
+    expect(res.statusCode).not.toBe(401);
+  });
+
+  it("POST /status without token returns 401 when auth enabled", async () => {
+    const res = await appWithAuth.inject({ method: "GET", url: "/status" });
+    expect(res.statusCode).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: error response schema (no internal detail leaked)
+// ---------------------------------------------------------------------------
+
+describe("Error response schema", () => {
+  let pool: Pool;
+  let app: Awaited<ReturnType<typeof createApp>>;
+
+  beforeAll(async () => {
+    // dead pool — forces DB errors on any endpoint that reaches the DB
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    app = await createApp(pool, embedder, cfg);
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end().catch(() => undefined);
+  });
+
+  it("400 validation errors have {error:{code,message,issues}} shape", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/remember",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}), // missing required workspaceId + content
+    });
+    expect(res.statusCode).toBe(400);
+    const body = JSON.parse(res.body) as {
+      error: { code: string; message: string; issues?: unknown[] };
+    };
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(typeof body.error.message).toBe("string");
+    expect(Array.isArray(body.error.issues)).toBe(true);
+  });
+
+  it("500 errors return INTERNAL code without pg connection details", async () => {
+    // /remember passes Zod validation but will fail at DB (dead pool)
+    const res = await app.inject({
+      method: "POST",
+      url: "/remember",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        content: "test content for error schema check",
+      }),
+    });
+    expect(res.statusCode).toBe(500);
+    const body = JSON.parse(res.body) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("INTERNAL");
+    expect(body.error.message).toBe("An internal error occurred");
+    // Must not leak pg connection details
+    expect(body.error.message).not.toMatch(/ECONNREFUSED|postgres|localhost|\d+\.\d+\.\d+\.\d+/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: /ingest returns 202 Accepted
+// ---------------------------------------------------------------------------
+
+describe("POST /ingest → 202 Accepted", () => {
+  let pool: Pool;
+  let app: Awaited<ReturnType<typeof createApp>>;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    app = await createApp(pool, embedder, cfg);
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end().catch(() => undefined);
+  });
+
+  it("returns 202 with { queued: true }", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/ingest",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        text: "some ingested text",
+      }),
+    });
+    expect(res.statusCode).toBe(202);
+    const body = JSON.parse(res.body) as { queued: boolean };
+    expect(body.queued).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: safety gate — non-localhost host without DOLORES_AUTH_TOKEN
+// ---------------------------------------------------------------------------
+
+describe("Safety gate: non-localhost without DOLORES_AUTH_TOKEN", () => {
+  const APP = "postgresql://noop:noop@localhost:5432/noop";
+
+  /**
+   * Run fn with env overrides, restoring prior values afterward. A value of
+   * undefined DELETES the key — `process.env.X = undefined` would coerce to the
+   * string "undefined" (truthy), which is exactly the bug this avoids.
+   */
+  function withEnv(overrides: Record<string, string | undefined>, fn: () => void): void {
+    const keys = Object.keys(overrides);
+    const saved: Record<string, string | undefined> = {};
+    for (const k of keys) saved[k] = process.env[k];
+    const apply = (values: Record<string, string | undefined>) => {
+      for (const k of keys) {
+        const v = values[k];
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    };
+    try {
+      apply(overrides);
+      fn();
+    } finally {
+      apply(saved);
+    }
+  }
+
+  it("loadConfig throws when DOLORES_DAEMON_HOST=0.0.0.0 and no auth token", () => {
+    withEnv(
+      {
+        DOLORES_DAEMON_HOST: "0.0.0.0",
+        DOLORES_AUTH_TOKEN: undefined,
+        DOLORES_APP_DATABASE_URL: APP,
+      },
+      () => expect(() => loadConfig()).toThrow(/DOLORES_AUTH_TOKEN/),
+    );
+  });
+
+  it("loadConfig succeeds when host is 0.0.0.0 with DOLORES_AUTH_TOKEN set", () => {
+    withEnv(
+      {
+        DOLORES_DAEMON_HOST: "0.0.0.0",
+        DOLORES_AUTH_TOKEN: "my-secure-token",
+        DOLORES_APP_DATABASE_URL: APP,
+      },
+      () => {
+        const config = loadConfig();
+        expect(config.host).toBe("0.0.0.0");
+        expect(config.authToken).toBe("my-secure-token");
+      },
+    );
+  });
+
+  it("loadConfig succeeds with localhost host and no auth token", () => {
+    withEnv(
+      {
+        DOLORES_DAEMON_HOST: "127.0.0.1",
+        DOLORES_AUTH_TOKEN: undefined,
+        DOLORES_APP_DATABASE_URL: APP,
+      },
+      () => {
+        const config = loadConfig();
+        expect(config.host).toBe("127.0.0.1");
+        expect(config.authToken).toBeUndefined();
+      },
+    );
   });
 });

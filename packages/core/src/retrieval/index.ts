@@ -4,4 +4,4 @@ export { fuseRrf, type FusedHit, type FuseOptions } from "./rrf.js";
 export { remember, SUPERSEDE_THRESHOLD } from "./remember.js";
 export { recall } from "./recall.js";
 export { buildContext, renderContext, type BuiltContext } from "./context.js";
-export { upsertFact, listFacts } from "./facts.js";
+export { upsertFact, listFacts, batchUpsertFacts } from "./facts.js";

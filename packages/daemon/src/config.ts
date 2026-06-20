@@ -1,6 +1,10 @@
 import type { DaemonConfig } from "@dolores/core";
 import { z } from "zod";
 
+export type DaemonRuntimeConfig = DaemonConfig & {
+  authToken?: string;
+};
+
 function parseBool(val: string | undefined): boolean {
   const v = (val ?? "").trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes" || v === "on";
@@ -17,10 +21,11 @@ const schema = z.object({
 });
 
 /**
- * Parse env vars into a validated DaemonConfig. Throws on first startup if
- * required vars (databaseUrl) are missing or a value is malformed.
+ * Parse env vars into a validated DaemonRuntimeConfig. Throws on startup if:
+ * - required vars are missing or malformed, OR
+ * - DOLORES_DAEMON_HOST is non-localhost and DOLORES_AUTH_TOKEN is unset.
  */
-export function loadConfig(): DaemonConfig {
+export function loadConfig(): DaemonRuntimeConfig {
   const raw = {
     host: process.env.DOLORES_DAEMON_HOST ?? "127.0.0.1",
     port: process.env.DOLORES_DAEMON_PORT ?? "4505",
@@ -37,5 +42,19 @@ export function loadConfig(): DaemonConfig {
     throw new Error(`[dolores-daemon] config error:\n${issues}`);
   }
 
-  return result.data as DaemonConfig;
+  const authToken = process.env.DOLORES_AUTH_TOKEN?.trim() || undefined;
+
+  // Security gate: if bound to a non-localhost address without an auth token,
+  // refuse to start — the daemon would be publicly accessible without auth (A01).
+  const host = result.data.host;
+  const isLocalhost = host === "127.0.0.1" || host === "localhost" || host === "::1";
+  if (!isLocalhost && !authToken) {
+    throw new Error(
+      "[dolores-daemon] FATAL: DOLORES_DAEMON_HOST is not a localhost address but " +
+        "DOLORES_AUTH_TOKEN is not set. Refusing to start — the daemon would be publicly " +
+        "accessible without authentication. Set DOLORES_AUTH_TOKEN or bind to 127.0.0.1.",
+    );
+  }
+
+  return { ...result.data, authToken };
 }

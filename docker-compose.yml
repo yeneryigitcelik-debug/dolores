@@ -13,6 +13,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-dolores}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dolores}
       POSTGRES_DB: ${POSTGRES_DB:-dolores}
+      DOLORES_APP_PASSWORD: ${DOLORES_APP_PASSWORD:-dolores}
     command:
       - "postgres"
       - "-c"

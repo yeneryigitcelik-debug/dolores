@@ -40,17 +40,39 @@ export function getPool(): Pool {
  * Applies the dolores schema to the connected database.
  * Idempotent — safe to call on every startup (`dolores init` calls this).
  *
+ * Wrapped in a single transaction: if any statement fails the entire migration
+ * is rolled back, preventing partial schema state.
+ *
+ * Reads DOLORES_APP_PASSWORD from the environment to set the dolores_app role
+ * password via a safely-escaped ALTER ROLE statement (no SQL injection risk).
+ * Falls back to 'dolores' with a warning when the variable is unset.
+ *
  * Creates:
  *  - pgvector + pg_cron extensions
  *  - facts and memories tables
- *  - All indexes (IVFFlat, GIN, composite)
- *  - RLS policies using dolores.workspace_id / dolores.user_id GUCs
- *  - Conservative pg_cron job ("memory-soften")
+ *  - All indexes (IVFFlat, GIN, composite ranking)
+ *  - HOT update optimization (fillfactor=80 on memories)
+ *  - RLS policies with both USING and WITH CHECK clauses
+ *  - SECURITY DEFINER decay functions (bypass FORCE RLS for pg_cron jobs)
+ *  - Conservative pg_cron job ("memory-soften" via dolores_soften_memories())
  */
 export async function applyMigrations(pool: Pool): Promise<void> {
+  if (!process.env.DOLORES_APP_PASSWORD) {
+    console.warn("[dolores/db] DOLORES_APP_PASSWORD is not set — using insecure default password");
+  }
   const client = await pool.connect();
   try {
+    await client.query("BEGIN");
     await client.query(INIT_SQL);
+    // ALTER ROLE DDL does not accept $1 parameters through the wire protocol.
+    // escapeLiteral() wraps the value in single quotes with proper escaping,
+    // making this safe against SQL injection even for adversarial input.
+    const pwd = client.escapeLiteral(process.env.DOLORES_APP_PASSWORD ?? "dolores");
+    await client.query(`ALTER ROLE dolores_app WITH PASSWORD ${pwd}`);
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
   } finally {
     client.release();
   }

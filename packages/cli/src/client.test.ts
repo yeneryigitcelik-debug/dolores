@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { DaemonError, daemonGet, daemonPost } from "./client.js";
 import type { CliConfig } from "./config.js";
 
@@ -64,6 +65,70 @@ describe("daemonGet", () => {
     expect(err).toBeInstanceOf(DaemonError);
     expect((err as DaemonError).status).toBe(503);
   });
+
+  it("extracts error.message from structured JSON error body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({ error: { code: "INVALID_INPUT", message: "content zorunludur" } }),
+          ),
+      }),
+    );
+
+    const err = await daemonGet(cfg, "/remember").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).message).toBe("content zorunludur");
+    expect((err as DaemonError).status).toBe(400);
+  });
+
+  it("falls back to generic Turkish message when error body is not valid JSON", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 500,
+        text: () => Promise.resolve("Internal Server Error"),
+      }),
+    );
+
+    const err = await daemonGet(cfg, "/status").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).message).toMatch(/beklenmeyen/i);
+    expect((err as DaemonError).status).toBe(500);
+  });
+
+  it("returns validated data when response matches provided schema", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ ok: true }),
+      }),
+    );
+
+    const schema = z.object({ ok: z.boolean() });
+    const result = await daemonGet(cfg, "/health", schema);
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("throws DaemonError when response does not match provided schema", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ unexpected: "shape" }),
+      }),
+    );
+
+    const schema = z.object({ ok: z.boolean() });
+    const err = await daemonGet(cfg, "/health", schema).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).message).toMatch(/beklenmeyen/i);
+  });
 });
 
 describe("daemonPost", () => {
@@ -108,5 +173,46 @@ describe("daemonPost", () => {
     const err = await daemonPost(cfg, "/remember", {}).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(DaemonError);
     expect((err as DaemonError).status).toBe(400);
+  });
+
+  it("extracts error.message from structured JSON error body on POST", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 422,
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              error: {
+                code: "VALIDATION_ERROR",
+                message: "importance must be between 1 and 10",
+                issues: ["importance: out of range"],
+              },
+            }),
+          ),
+      }),
+    );
+
+    const err = await daemonPost(cfg, "/remember", {}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).message).toContain("importance must be between 1 and 10");
+    expect((err as DaemonError).message).toContain("importance: out of range");
+    expect((err as DaemonError).status).toBe(422);
+  });
+
+  it("validates POST response with schema and throws on invalid shape", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ wrong: "field" }),
+      }),
+    );
+
+    const schema = z.object({ id: z.string(), deduped: z.boolean() });
+    const err = await daemonPost(cfg, "/remember", {}, schema).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(DaemonError);
+    expect((err as DaemonError).message).toMatch(/beklenmeyen/i);
   });
 });

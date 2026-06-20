@@ -1,6 +1,9 @@
 /**
  * Embedded migration SQL — mirrors prisma/migrations/20240620000000_init/migration.sql.
  * All statements are idempotent; applyMigrations() can be called on every startup.
+ *
+ * Password for dolores_app is NOT embedded here — applyMigrations() sets it via
+ * a parameterized ALTER ROLE call using DOLORES_APP_PASSWORD env var.
  */
 export const INIT_SQL = /* sql */ `
 -- Extensions
@@ -35,10 +38,14 @@ CREATE TABLE IF NOT EXISTS memories (
   content_tsv   TSVECTOR    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
 );
 
+-- HOT update optimization: last_accessed/importance update on every recall hit.
+-- fillfactor=80 reserves 20% of each page so updates stay on the same page (HOT).
+ALTER TABLE memories SET (fillfactor=80);
+
 -- Indexes on facts
 -- Single NULLS NOT DISTINCT unique index (PG15+). A predicate-less
--- ON CONFLICT (workspace_id, user_id, category, key) — which core's upsertFact
--- uses — cannot infer a PARTIAL unique index, so one combined index is required.
+-- ON CONFLICT (workspace_id, user_id, category, key) cannot infer a PARTIAL
+-- unique index, so one combined index is required.
 -- NULLS NOT DISTINCT makes workspace-level facts (user_id IS NULL) dedupe too.
 CREATE UNIQUE INDEX IF NOT EXISTS facts_ws_user_cat_key
   ON facts (workspace_id, user_id, category, key)
@@ -54,19 +61,35 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding
   WITH (lists = 100);
 CREATE INDEX IF NOT EXISTS idx_memories_content_tsv
   ON memories USING gin (content_tsv);
+-- Composite index covers buildContext/prune/decay ranking queries to avoid seq-scan.
+CREATE INDEX IF NOT EXISTS idx_memories_ranking
+  ON memories (workspace_id, importance DESC, last_accessed DESC, created_at DESC);
 
--- RLS: memories (FORCE ensures non-superuser table owners also comply)
+-- RLS: memories (FORCE ensures table owner also complies, not just non-owners)
 -- CASE avoids ''::uuid cast error — PostgreSQL does not short-circuit AND in policies.
 -- DROP + CREATE for idempotency (PostgreSQL has no CREATE OR REPLACE POLICY).
-ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
-ALTER TABLE memories FORCE ROW LEVEL SECURITY;
 -- After a transaction that used set_config('dolores.workspace_id', uuid, true) commits,
 -- PostgreSQL reverts the GUC to '' (empty string), not NULL. Both UUID casts must use
 -- CASE WHEN nullif(..., '') IS NOT NULL to guard against the ''::uuid cast error.
+ALTER TABLE memories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memories FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS memories_tenant_isolation ON memories;
 CREATE POLICY memories_tenant_isolation ON memories
   AS PERMISSIVE FOR ALL
   USING (
+    workspace_id = CASE
+      WHEN nullif(current_setting('dolores.workspace_id', true), '') IS NOT NULL
+      THEN current_setting('dolores.workspace_id', true)::uuid
+    END
+    AND (
+      user_id IS NULL
+      OR user_id = CASE
+        WHEN nullif(current_setting('dolores.user_id', true), '') IS NOT NULL
+        THEN current_setting('dolores.user_id', true)::uuid
+      END
+    )
+  )
+  WITH CHECK (
     workspace_id = CASE
       WHEN nullif(current_setting('dolores.workspace_id', true), '') IS NOT NULL
       THEN current_setting('dolores.workspace_id', true)::uuid
@@ -98,14 +121,28 @@ CREATE POLICY facts_tenant_isolation ON facts
         THEN current_setting('dolores.user_id', true)::uuid
       END
     )
+  )
+  WITH CHECK (
+    workspace_id = CASE
+      WHEN nullif(current_setting('dolores.workspace_id', true), '') IS NOT NULL
+      THEN current_setting('dolores.workspace_id', true)::uuid
+    END
+    AND (
+      user_id IS NULL
+      OR user_id = CASE
+        WHEN nullif(current_setting('dolores.user_id', true), '') IS NOT NULL
+        THEN current_setting('dolores.user_id', true)::uuid
+      END
+    )
   );
 
 -- Application role (non-superuser): daemon must connect as this user for RLS to apply.
 -- Superusers (POSTGRES_USER=dolores) bypass RLS even with FORCE ROW LEVEL SECURITY.
+-- Password is NOT set here — applyMigrations() sets it via DOLORES_APP_PASSWORD env var.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dolores_app') THEN
-    CREATE ROLE dolores_app WITH LOGIN PASSWORD 'dolores';
+    CREATE ROLE dolores_app WITH LOGIN;
   END IF;
 END;
 $$;
@@ -113,16 +150,44 @@ GRANT CONNECT ON DATABASE dolores TO dolores_app;
 GRANT USAGE ON SCHEMA public TO dolores_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE memories, facts TO dolores_app;
 
--- pg_cron: conservative decay (daily soft-decay, never deletes)
+-- SECURITY DEFINER decay functions: pg_cron jobs run without dolores.workspace_id GUC.
+-- FORCE ROW LEVEL SECURITY means even the scheduler role sees 0 rows via the policy
+-- (workspace_id = NULL → false). SECURITY DEFINER runs the function as the creating
+-- superuser, which bypasses RLS entirely — the correct scope for maintenance jobs.
+-- SET search_path = public prevents search_path hijacking attacks.
+CREATE OR REPLACE FUNCTION dolores_soften_memories()
+  RETURNS void
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public
+AS $$
+BEGIN
+  UPDATE memories
+     SET importance = GREATEST(1, importance - 1)
+   WHERE last_accessed < now() - INTERVAL '30 days'
+     AND importance > 1;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION dolores_decay_memories()
+  RETURNS void
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public
+AS $$
+BEGIN
+  DELETE FROM memories
+   WHERE importance < 3
+     AND last_accessed < now() - INTERVAL '90 days';
+END;
+$$;
+
+-- pg_cron: conservative decay via SECURITY DEFINER function (daily, never deletes).
+-- cron.schedule() upserts by jobname — idempotent.
 SELECT cron.schedule(
   'memory-soften',
   '0 3 * * *',
-  $$
-    UPDATE memories
-       SET importance = GREATEST(1, importance - 1)
-     WHERE last_accessed < now() - INTERVAL '30 days'
-       AND importance > 1
-  $$
+  'SELECT dolores_soften_memories()'
 );
 `;
 
@@ -131,10 +196,6 @@ export const AGGRESSIVE_DECAY_SQL = /* sql */ `
 SELECT cron.schedule(
   'memory-decay',
   '0 4 * * *',
-  $$
-    DELETE FROM memories
-     WHERE importance < 3
-       AND last_accessed < now() - INTERVAL '90 days'
-  $$
+  'SELECT dolores_decay_memories()'
 );
 `;

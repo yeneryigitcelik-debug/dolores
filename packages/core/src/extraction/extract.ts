@@ -1,7 +1,7 @@
 import type { Pool } from "pg";
 import { z } from "zod";
-import { upsertFact } from "../retrieval/facts.js";
-import { remember } from "../retrieval/remember.js";
+import { batchUpsertFacts } from "../retrieval/facts.js";
+import { _rememberPreembedded } from "../retrieval/remember.js";
 import type { Embedder, FactInput, MemoryContext, RememberInput } from "../types.js";
 import { type LlmProvider, createLlmProviderFromEnv } from "./provider.js";
 
@@ -127,14 +127,31 @@ export async function ingestText(
   opts: ExtractionOptions = {},
 ): Promise<IngestSummary> {
   const { facts, memories } = await extractFromText(text, opts);
-  let deduped = 0;
-  for (const fact of facts) {
-    await upsertFact(pool, ctx, fact);
+
+  // All facts in a single transaction via unnest (N→1 round-trips).
+  await batchUpsertFacts(pool, ctx, facts);
+
+  // Embed all memory contents in one batch call (N ONNX inferences → 1).
+  let vectors: number[][] = [];
+  if (embedder.dim > 0 && memories.length > 0) {
+    try {
+      vectors = await embedder.embed(memories.map((m) => m.content.trim()));
+    } catch (err) {
+      console.warn(
+        `[dolores] ingestText: batch embed failed, falling back to full-text only: ${asMessage(err)}`,
+      );
+    }
   }
+
+  // Write memories with pre-computed vectors (dedup logic preserved).
+  let deduped = 0;
+  let vi = 0;
   for (const memory of memories) {
-    const res = await remember(pool, ctx, embedder, memory);
+    const vec = vectors[vi++] ?? null;
+    const res = await _rememberPreembedded(pool, ctx, memory, vec);
     if (res.deduped) deduped += 1;
   }
+
   return { factsWritten: facts.length, memoriesWritten: memories.length, deduped };
 }
 

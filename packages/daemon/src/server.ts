@@ -1,6 +1,5 @@
 import {
   type ContextResponse,
-  type DaemonConfig,
   type DecayMode,
   type Embedder,
   type FactsListResponse,
@@ -21,9 +20,10 @@ import {
   upsertFact,
   withTenant,
 } from "@dolores/core";
-import Fastify, { type FastifyInstance, type FastifyError } from "fastify";
+import Fastify, { type FastifyError, type FastifyInstance } from "fastify";
 import { Pool } from "pg";
 import { z } from "zod";
+import type { DaemonRuntimeConfig } from "./config.js";
 
 // ---------------------------------------------------------------------------
 // Zod schemas for request bodies
@@ -37,14 +37,14 @@ const ctxSchema = z.object({
 });
 
 const rememberBodySchema = ctxSchema.extend({
-  content: z.string().min(1, "content must be non-empty"),
+  content: z.string().min(1, "content must be non-empty").max(50_000),
   scope: scopeSchema.optional(),
   importance: z.number().int().min(1).max(10).optional(),
   source: z.string().optional(),
 });
 
 const recallBodySchema = ctxSchema.extend({
-  query: z.string().min(1, "query must be non-empty"),
+  query: z.string().min(1, "query must be non-empty").max(2_000),
   limit: z.number().int().min(1).max(100).optional(),
   scope: scopeSchema.optional(),
   minImportance: z.number().int().min(1).max(10).optional(),
@@ -66,7 +66,7 @@ const factsUpsertBodySchema = ctxSchema.extend({
 });
 
 const ingestBodySchema = ctxSchema.extend({
-  text: z.string().min(1, "text must be non-empty"),
+  text: z.string().min(1, "text must be non-empty").max(100_000),
   source: z.string().optional(),
 });
 
@@ -133,7 +133,7 @@ async function runPrune(
 export async function createApp(
   pool: Pool,
   embedder: Embedder,
-  config: DaemonConfig,
+  config: DaemonRuntimeConfig,
   // Optional superuser pool for /status global counts — bypasses RLS.
   // Retrieval/recall/remember still use `pool` (app user + RLS).
   adminPool?: Pool,
@@ -142,17 +142,30 @@ export async function createApp(
 
   // ---------- Global error handler ----------
   app.setErrorHandler(async (error: FastifyError, _req, reply) => {
-    // JSON parse errors from malformed request bodies
+    // JSON parse errors and other client-side errors (4xx)
     if ((error.statusCode ?? 500) < 500) {
       return reply
         .status(error.statusCode ?? 400)
-        .send({ error: { code: "PARSE_ERROR", message: error.message } });
+        .send({ error: { code: "VALIDATION_ERROR", message: error.message } });
     }
     console.error("[dolores-daemon] unhandled error:", error.message);
     return reply
       .status(500)
-      .send({ error: { code: "INTERNAL_ERROR", message: "An internal error occurred" } });
+      .send({ error: { code: "INTERNAL", message: "An internal error occurred" } });
   });
+
+  // ---------- Bearer auth hook (skip /health) ----------
+  if (config.authToken) {
+    const expectedHeader = `Bearer ${config.authToken}`;
+    app.addHook("onRequest", async (request, reply) => {
+      if (request.url.split("?")[0] === "/health") return;
+      if (request.headers.authorization !== expectedHeader) {
+        return reply.status(401).send({
+          error: { code: "UNAUTHORIZED", message: "Invalid or missing authorization token" },
+        });
+      }
+    });
+  }
 
   // ---------- GET /health ----------
   app.get("/health", async (): Promise<HealthResponse> => {
@@ -215,17 +228,22 @@ export async function createApp(
   app.post("/remember", async (request, reply): Promise<RememberResponse | undefined> => {
     const parsed = rememberBodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply
-        .status(400)
-        .send({ error: { code: "VALIDATION_ERROR", issues: parsed.error.issues } });
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
     }
     const { workspaceId, userId, content, scope, importance, source } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
       return await remember(pool, ctx, embedder, { content, scope, importance, source });
     } catch (err) {
+      console.error("[dolores-daemon] /remember error:", errMsg(err));
       return reply.status(500).send({
-        error: { code: "INTERNAL_ERROR", message: errMsg(err) },
+        error: { code: "INTERNAL", message: "An internal error occurred" },
       });
     }
   });
@@ -234,17 +252,22 @@ export async function createApp(
   app.post("/recall", async (request, reply): Promise<RecallResponse | undefined> => {
     const parsed = recallBodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply
-        .status(400)
-        .send({ error: { code: "VALIDATION_ERROR", issues: parsed.error.issues } });
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
     }
     const { workspaceId, userId, query, limit, scope, minImportance } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
       return await recall(pool, ctx, embedder, { query, limit, scope, minImportance });
     } catch (err) {
+      console.error("[dolores-daemon] /recall error:", errMsg(err));
       return reply.status(500).send({
-        error: { code: "INTERNAL_ERROR", message: errMsg(err) },
+        error: { code: "INTERNAL", message: "An internal error occurred" },
       });
     }
   });
@@ -253,9 +276,13 @@ export async function createApp(
   app.post("/context", async (request, reply): Promise<ContextResponse | undefined> => {
     const parsed = contextBodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply
-        .status(400)
-        .send({ error: { code: "VALIDATION_ERROR", issues: parsed.error.issues } });
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
     }
     const { workspaceId, userId, maxTokens } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
@@ -263,8 +290,9 @@ export async function createApp(
       const result = await buildContext(pool, ctx, maxTokens);
       return { text: result.text, tokenEstimate: result.tokenEstimate };
     } catch (err) {
+      console.error("[dolores-daemon] /context error:", errMsg(err));
       return reply.status(500).send({
-        error: { code: "INTERNAL_ERROR", message: errMsg(err) },
+        error: { code: "INTERNAL", message: "An internal error occurred" },
       });
     }
   });
@@ -273,9 +301,13 @@ export async function createApp(
   app.post("/facts/list", async (request, reply): Promise<FactsListResponse | undefined> => {
     const parsed = factsListBodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply
-        .status(400)
-        .send({ error: { code: "VALIDATION_ERROR", issues: parsed.error.issues } });
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
     }
     const { workspaceId, userId, category } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
@@ -283,8 +315,9 @@ export async function createApp(
       const facts = await listFacts(pool, ctx, category);
       return { facts };
     } catch (err) {
+      console.error("[dolores-daemon] /facts/list error:", errMsg(err));
       return reply.status(500).send({
-        error: { code: "INTERNAL_ERROR", message: errMsg(err) },
+        error: { code: "INTERNAL", message: "An internal error occurred" },
       });
     }
   });
@@ -293,9 +326,13 @@ export async function createApp(
   app.post("/facts/upsert", async (request, reply): Promise<FactsUpsertResponse | undefined> => {
     const parsed = factsUpsertBodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply
-        .status(400)
-        .send({ error: { code: "VALIDATION_ERROR", issues: parsed.error.issues } });
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
     }
     const { workspaceId, userId, category, key, value, scope } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
@@ -303,21 +340,26 @@ export async function createApp(
       const fact = await upsertFact(pool, ctx, { category, key, value, scope });
       return { fact };
     } catch (err) {
+      console.error("[dolores-daemon] /facts/upsert error:", errMsg(err));
       return reply.status(500).send({
-        error: { code: "INTERNAL_ERROR", message: errMsg(err) },
+        error: { code: "INTERNAL", message: "An internal error occurred" },
       });
     }
   });
 
   // ---------- POST /ingest ----------
-  // Fire-and-forget: respond immediately, extraction runs async.
+  // Fire-and-forget: respond 202 immediately, extraction runs async.
   // Gracefully handles: extraction disabled, no provider, LLM errors.
   app.post("/ingest", async (request, reply): Promise<IngestResponse | undefined> => {
     const parsed = ingestBodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply
-        .status(400)
-        .send({ error: { code: "VALIDATION_ERROR", issues: parsed.error.issues } });
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
     }
     const { workspaceId, userId, text, source } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
@@ -329,16 +371,20 @@ export async function createApp(
       console.error("[dolores-daemon] ingest background error:", errMsg(err));
     });
 
-    return { queued: true };
+    return reply.status(202).send({ queued: true });
   });
 
   // ---------- POST /prune ----------
   app.post("/prune", async (request, reply): Promise<PruneResponse | undefined> => {
     const parsed = pruneBodySchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply
-        .status(400)
-        .send({ error: { code: "VALIDATION_ERROR", issues: parsed.error.issues } });
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
     }
     const { workspaceId, userId, dryRun = false } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
@@ -346,8 +392,9 @@ export async function createApp(
       const { softened, deleted } = await runPrune(pool, ctx, config.decayMode, dryRun);
       return { deleted, softened, dryRun };
     } catch (err) {
+      console.error("[dolores-daemon] /prune error:", errMsg(err));
       return reply.status(500).send({
-        error: { code: "INTERNAL_ERROR", message: errMsg(err) },
+        error: { code: "INTERNAL", message: "An internal error occurred" },
       });
     }
   });
@@ -359,19 +406,25 @@ export async function createApp(
 // Start: load embedder once, create pool, bind and listen
 // ---------------------------------------------------------------------------
 
-export async function startDaemon(config: DaemonConfig): Promise<void> {
+export async function startDaemon(config: DaemonRuntimeConfig): Promise<void> {
   const embedder = createEmbedder(config.embedder, config.embedModel);
 
   console.log(`[dolores-daemon] loading embedder ${embedder.id}...`);
   await embedder.ready();
   console.log(`[dolores-daemon] embedder ready (dim=${embedder.dim})`);
 
-  const pool = new Pool({ connectionString: config.databaseUrl });
+  const pool = new Pool({
+    connectionString: config.databaseUrl,
+    max: 10,
+    idleTimeoutMillis: 30_000,
+  });
 
   // Superuser pool for /status global counts — reads DATABASE_URL which has
   // BYPASSRLS / superuser privileges, unlike the app pool (dolores_app + RLS).
   const adminUrl = process.env.DATABASE_URL;
-  const adminPool = adminUrl ? new Pool({ connectionString: adminUrl }) : undefined;
+  const adminPool = adminUrl
+    ? new Pool({ connectionString: adminUrl, max: 3, idleTimeoutMillis: 30_000 })
+    : undefined;
 
   const app = await createApp(pool, embedder, config, adminPool);
 

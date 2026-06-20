@@ -7,8 +7,10 @@ import { applyMigrations, withTenant } from "./index.js";
 const ADMIN_URL = process.env.DATABASE_URL ?? "postgresql://dolores:dolores@localhost:5433/dolores";
 
 // Application pool — non-superuser; subject to RLS policies.
-// applyMigrations creates this role (dolores_app / password: dolores).
-const APP_URL = ADMIN_URL.replace(/\/\/[^:]+:[^@]+@/, "//dolores_app:dolores@");
+// Password is taken from DOLORES_APP_PASSWORD (or 'dolores' default) to match
+// whatever applyMigrations() sets on the dolores_app role.
+const APP_PWD = process.env.DOLORES_APP_PASSWORD ?? "dolores";
+const APP_URL = ADMIN_URL.replace(/\/\/[^:]+:[^@]+@/, `//dolores_app:${APP_PWD}@`);
 
 let adminPool: Pool;
 let appPool: Pool;
@@ -179,6 +181,55 @@ describe("withTenant RLS isolation (app pool — non-superuser)", () => {
     try {
       const { rows } = await client.query("SELECT id FROM memories");
       expect(rows).toHaveLength(0);
+    } finally {
+      client.release();
+    }
+  });
+});
+
+describe("decay functions (SECURITY DEFINER — bypasses FORCE RLS)", () => {
+  // Isolated workspace UUID used only by these tests; cleaned up after.
+  const wsDecay = "f0000000-deca-deca-deca-000000000000";
+
+  afterAll(async () => {
+    if (!dbAvailable) return;
+    await adminPool.query("DELETE FROM memories WHERE workspace_id = $1", [wsDecay]);
+  });
+
+  it("dolores_soften_memories() reduces importance of stale rows (no GUC needed)", async () => {
+    if (skipIfNoDb()) return;
+
+    // Insert a stale memory directly via superuser (bypasses RLS for test setup)
+    const {
+      rows: [inserted],
+    } = await adminPool.query<{ id: string }>(
+      `INSERT INTO memories (workspace_id, content, importance, last_accessed)
+       VALUES ($1, 'decay-test stale memory', 5, now() - INTERVAL '60 days')
+       RETURNING id`,
+      [wsDecay],
+    );
+
+    // Call SECURITY DEFINER function — runs as owning superuser, bypasses FORCE RLS.
+    // No dolores.workspace_id GUC is set, which is exactly the pg_cron scenario.
+    await adminPool.query("SELECT dolores_soften_memories()");
+
+    const {
+      rows: [updated],
+    } = await adminPool.query<{ importance: number }>(
+      "SELECT importance FROM memories WHERE id = $1",
+      [inserted.id],
+    );
+    // importance must have dropped from 5 → 4
+    expect(updated.importance).toBe(4);
+  });
+
+  it("dolores_app connects with password from DOLORES_APP_PASSWORD (or default)", async () => {
+    if (skipIfNoDb()) return;
+    // If appPool connects successfully, applyMigrations set the correct password.
+    const client = await appPool.connect();
+    try {
+      const { rows } = await client.query<{ current_user: string }>("SELECT current_user");
+      expect(rows[0]?.current_user).toBe("dolores_app");
     } finally {
       client.release();
     }

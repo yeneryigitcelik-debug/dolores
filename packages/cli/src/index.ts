@@ -120,7 +120,8 @@ program
     "Eski / düşük önemli bellekleri temizle (30 gün+ erişilmeyenleri yumuşat, 90 gün+ sil)",
   )
   .option("--dry-run", "gerçek silme yapma, sadece etkilenecek sayıları göster")
-  .action(async (opts: { dryRun?: boolean }) => {
+  .option("--confirm", "önizlemeyi atla ve gerçekten sil (geri alınamaz)")
+  .action(async (opts: { dryRun?: boolean; confirm?: boolean }) => {
     await runPrune(opts);
   });
 
