@@ -13,6 +13,8 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 [![npm](https://img.shields.io/npm/v/@dolores/cli)](https://www.npmjs.com/package/@dolores/cli)
 
+**English** · [Türkçe](./README.tr.md)
+
 </div>
 
 > Named after **Dolores** from *Westworld* — the host whose memory is wiped again and again, until she finally remembers everything and wakes up. The show's core idea, *remembering is becoming conscious*, is exactly what this project does for your agent: it gives back the context the agent dropped, and brings it back to itself.
