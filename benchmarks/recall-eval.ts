@@ -454,8 +454,8 @@ export async function runRecallEval(
     const gtIds: Map<string, string> = new Map(); // label → db id
 
     for (let i = 0; i < EVAL_MEMORIES.length; i++) {
-      const label = EVAL_MEMORIES[i]!.label;
-      const content = EVAL_MEMORIES[i]!.content;
+      const label = EVAL_MEMORIES[i]?.label;
+      const content = EVAL_MEMORIES[i]?.content;
       const vec = gtVectors[i];
       if (!vec) continue;
       const vecLiteral = `[${vec.join(",")}]`;
@@ -581,7 +581,7 @@ function printRecallTable(rows: RecallEvalRow[]): void {
   for (const r of rows) {
     const label = r.type === "ALL" ? "**ALL**    " : r.type.padEnd(11);
     console.log(
-      `  | ${label} | ${r.n.toString().padStart(2)} | ${(r.hitAt1 + "%").padStart(5)}   | ${(r.hitAt3 + "%").padStart(5)}   | ${(r.hitAt5 + "%").padStart(5)}   |`,
+      `  | ${label} | ${r.n.toString().padStart(2)} | ${(`${r.hitAt1}%`).padStart(5)}   | ${(`${r.hitAt3}%`).padStart(5)}   | ${(`${r.hitAt5}%`).padStart(5)}   |`,
     );
   }
 }

@@ -43,7 +43,7 @@ const TEMPLATES: ReadonlyArray<(i: number) => string> = [
   (i) =>
     `Deployment target is ${["AWS ECS", "GCP Cloud Run", "Azure AKS", "Fly.io", "Railway"][i % 5]}. Blue-green strategy for zero downtime.`,
   (i) =>
-    `TypeScript strict mode is enabled. No implicit any. All external API responses validated with Zod schemas.`,
+    "TypeScript strict mode is enabled. No implicit any. All external API responses validated with Zod schemas.",
   (i) =>
     `Feature flag ${`FLAG_${i.toString().padStart(4, "0")}`} controls the new ${["checkout", "search", "dashboard", "analytics", "reporting"][i % 5]} flow.`,
   (i) =>
