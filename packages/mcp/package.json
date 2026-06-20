@@ -2,6 +2,31 @@
   "name": "@dolores/mcp",
   "version": "0.1.0",
   "type": "module",
+  "description": "MCP server that exposes dolores remember/recall tools to Claude Code, Cursor, and other MCP-compatible AI clients.",
+  "keywords": [
+    "ai",
+    "agent-memory",
+    "memory",
+    "mcp",
+    "llm",
+    "claude",
+    "retrieval",
+    "recall",
+    "rag"
+  ],
+  "homepage": "https://github.com/yeneryigitcelik-debug/dolores#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yeneryigitcelik-debug/dolores.git",
+    "directory": "packages/mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/yeneryigitcelik-debug/dolores/issues"
+  },
+  "author": "Yener Yiğit Çelik",
+  "license": "MIT",
+  "files": ["dist", "README.md"],
+  "publishConfig": { "access": "public" },
   "bin": {
     "dolores-mcp": "./dist/index.js"
   },

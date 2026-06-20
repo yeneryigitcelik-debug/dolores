@@ -2,6 +2,31 @@
   "name": "@dolores/core",
   "version": "0.1.0",
   "type": "module",
+  "description": "Core types, hybrid retrieval (pgvector + full-text), embedder abstraction, and LLM extraction pipeline for the dolores agent memory system.",
+  "keywords": [
+    "ai",
+    "agent-memory",
+    "memory",
+    "embeddings",
+    "pgvector",
+    "retrieval",
+    "rag",
+    "llm",
+    "mcp"
+  ],
+  "homepage": "https://github.com/yeneryigitcelik-debug/dolores#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yeneryigitcelik-debug/dolores.git",
+    "directory": "packages/core"
+  },
+  "bugs": {
+    "url": "https://github.com/yeneryigitcelik-debug/dolores/issues"
+  },
+  "author": "Yener Yiğit Çelik",
+  "license": "MIT",
+  "files": ["dist", "README.md"],
+  "publishConfig": { "access": "public" },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

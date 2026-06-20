@@ -2,6 +2,31 @@
   "name": "@dolores/daemon",
   "version": "0.1.0",
   "type": "module",
+  "description": "Long-running HTTP service (Fastify) that owns the Postgres connection pool and embedding model for the dolores agent memory system.",
+  "keywords": [
+    "ai",
+    "agent-memory",
+    "memory",
+    "daemon",
+    "fastify",
+    "embeddings",
+    "llm",
+    "postgres",
+    "pgvector"
+  ],
+  "homepage": "https://github.com/yeneryigitcelik-debug/dolores#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yeneryigitcelik-debug/dolores.git",
+    "directory": "packages/daemon"
+  },
+  "bugs": {
+    "url": "https://github.com/yeneryigitcelik-debug/dolores/issues"
+  },
+  "author": "Yener Yiğit Çelik",
+  "license": "MIT",
+  "files": ["dist", "README.md"],
+  "publishConfig": { "access": "public" },
   "main": "./dist/index.js",
   "bin": {
     "dolores-daemon": "./dist/index.js"

@@ -2,6 +2,21 @@
   "name": "@dolores/cli",
   "version": "0.1.0",
   "type": "module",
+  "description": "Command-line interface for dolores agent memory — init, remember, recall, context, and ingest commands.",
+  "keywords": ["ai", "agent-memory", "memory", "cli", "llm", "recall", "postgres", "pgvector"],
+  "homepage": "https://github.com/yeneryigitcelik-debug/dolores#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yeneryigitcelik-debug/dolores.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/yeneryigitcelik-debug/dolores/issues"
+  },
+  "author": "Yener Yiğit Çelik",
+  "license": "MIT",
+  "files": ["dist", "README.md"],
+  "publishConfig": { "access": "public" },
   "bin": {
     "dolores": "./dist/index.js"
   },

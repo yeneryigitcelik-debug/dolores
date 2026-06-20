@@ -11,6 +11,7 @@
 [![PostgreSQL + pgvector](https://img.shields.io/badge/PostgreSQL-pgvector-4169E1?logo=postgresql&logoColor=white)](https://github.com/pgvector/pgvector)
 [![MCP](https://img.shields.io/badge/MCP-remember%20%2F%20recall-8A63D2)](https://modelcontextprotocol.io/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
+[![npm](https://img.shields.io/npm/v/@dolores/cli)](https://www.npmjs.com/package/@dolores/cli)
 
 </div>
 
@@ -48,6 +49,14 @@ The only thing you pay for is the LLM subscription you already have (Claude Pro/
 ```
 
 A single long-running **daemon** loads the embedding model once (no cold-start) and owns the one connection pool. The **CLI** and **MCP server** are thin clients that talk to it over localhost. Postgres does the rest — vector search, full-text, and maintenance — in one engine.
+
+## Install
+
+```bash
+npm i -g @dolores/cli   # global CLI
+```
+
+Or run from source (see below).
 
 ## Quick start
 
