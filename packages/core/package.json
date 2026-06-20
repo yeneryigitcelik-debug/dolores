@@ -50,6 +50,7 @@
     "@types/pg": "^8.11.10"
   },
   "optionalDependencies": {
+    "@anthropic-ai/sdk": "^0.105.0",
     "openai": "^4.77.0"
   }
 }

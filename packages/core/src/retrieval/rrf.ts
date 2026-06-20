@@ -45,3 +45,55 @@ export function fuseRrf(arms: string[][], opts: FuseOptions = {}): FusedHit[] {
 
   return opts.limit !== undefined ? fused.slice(0, opts.limit) : fused;
 }
+
+// ---------------------------------------------------------------------------
+// Importance + recency boost (re-ranks fused hits; similarity stays dominant)
+// ---------------------------------------------------------------------------
+
+/** Default boost weights — deliberately SMALL so RRF similarity dominates. */
+export const DEFAULT_BOOST_IMPORTANCE = 0.15;
+export const DEFAULT_BOOST_RECENCY = 0.1;
+/** Recency half-life: a memory touched this long ago contributes 0.5 recencyNorm. */
+const DEFAULT_RECENCY_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+export interface BoostableHit extends FusedHit {
+  /** 1..10 importance of the underlying memory. */
+  importance: number;
+  /** Age of the memory's last_accessed in ms (now - last_accessed). */
+  ageMs: number;
+}
+
+export interface BoostOptions {
+  wImportance?: number;
+  wRecency?: number;
+  recencyHalfLifeMs?: number;
+}
+
+/**
+ * Re-rank fused RRF hits with a LIGHT importance + recency boost. The RRF score
+ * (the hybrid similarity signal) stays DOMINANT — the boost only nudges near-ties
+ * so a more important / fresher memory edges out an equally-similar one.
+ *
+ *   recencyNorm = 0.5 ^ (ageMs / halfLife)        // 1 = just touched → 0 = stale
+ *   mult        = 1 + wImp·(importance/10) + wRec·recencyNorm
+ *   score       = rrfScore · mult / (1 + wImp + wRec)
+ *
+ * Dividing by the maximum possible multiplier renormalises into 0..1, so the
+ * RecallHit.score contract (normalized score) is preserved. Returns hits sorted
+ * by the boosted score, descending.
+ */
+export function applyBoost(hits: BoostableHit[], opts: BoostOptions = {}): FusedHit[] {
+  const wImp = opts.wImportance ?? DEFAULT_BOOST_IMPORTANCE;
+  const wRec = opts.wRecency ?? DEFAULT_BOOST_RECENCY;
+  const halfLife = opts.recencyHalfLifeMs ?? DEFAULT_RECENCY_HALF_LIFE_MS;
+  const maxMult = 1 + wImp + wRec;
+
+  const boosted = hits.map((h) => {
+    const imp = Math.min(10, Math.max(1, h.importance)) / 10;
+    const recencyNorm = halfLife > 0 ? 0.5 ** (Math.max(0, h.ageMs) / halfLife) : 0;
+    const mult = 1 + wImp * imp + wRec * recencyNorm;
+    return { id: h.id, score: (h.score * mult) / maxMult };
+  });
+  boosted.sort((a, b) => b.score - a.score);
+  return boosted;
+}

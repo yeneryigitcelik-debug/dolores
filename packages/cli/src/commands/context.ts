@@ -4,6 +4,7 @@ import { getConfig, memoryContext } from "../config.js";
 
 interface ContextOptions {
   maxTokens?: number;
+  query?: string;
 }
 
 export async function runContext(opts: ContextOptions): Promise<void> {
@@ -13,6 +14,7 @@ export async function runContext(opts: ContextOptions): Promise<void> {
   const body: ContextRequest = {
     ...ctx,
     maxTokens: opts.maxTokens,
+    query: opts.query,
   };
 
   try {

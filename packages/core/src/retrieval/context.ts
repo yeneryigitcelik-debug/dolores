@@ -1,11 +1,16 @@
-import type { Pool } from "pg";
-import type { Fact, MemoryContext } from "../types.js";
+import type { Pool, PoolClient } from "pg";
+import { NoOpEmbedder } from "../embedder/noop.js";
+import type { Embedder, Fact, MemoryContext } from "../types.js";
+import { recall } from "./recall.js";
 import { type FactRow, type MemoryRow, rowToFact } from "./sql.js";
 import { withTenant } from "./tenant.js";
 import { tokenEstimate } from "./tokens.js";
 
 /** How many candidate memories to consider before token-budget trimming. */
 const MEMORY_CANDIDATES = 50;
+
+const FACT_SELECT =
+  "SELECT id, workspace_id, user_id, scope, category, key, value, created_at, updated_at FROM facts ORDER BY category, key";
 
 export interface BuiltContext {
   text: string;
@@ -14,23 +19,48 @@ export interface BuiltContext {
 
 type RenderMemory = Pick<MemoryRow, "content" | "importance">;
 
+async function fetchFacts(client: PoolClient): Promise<Fact[]> {
+  const res = await client.query<FactRow>(FACT_SELECT);
+  return res.rows.map(rowToFact);
+}
+
 /**
- * Deterministically render facts + the most important/fresh memories into a
- * compact system-prompt blob, capped at `maxTokens`. Pure SQL — no LLM, no
- * embedder. Facts are rendered first (deterministic, cheap, high-signal), then
- * the remaining budget is filled with memories.
+ * Render facts + memories into a compact system-prompt blob, capped at
+ * `maxTokens`. Pure SQL — no LLM. Facts are rendered first (deterministic, cheap,
+ * high-signal), then the remaining budget is filled with memories.
+ *
+ * Two modes:
+ *  - `query` omitted → static identity blob: the most important / freshest
+ *    memories (importance DESC, last_accessed DESC).
+ *  - `query` given → task-aware: the most RELEVANT memories for that query via
+ *    hybrid recall (pgvector + full-text). Pass `embedder` to enable the vector
+ *    arm; without one a NoOpEmbedder is used (full-text-only relevance). recall
+ *    is pure SQL+vector — still no LLM on this path.
  */
 export async function buildContext(
   pool: Pool,
   ctx: MemoryContext,
   maxTokens = 600,
+  query?: string,
+  embedder?: Embedder,
 ): Promise<BuiltContext> {
+  const trimmedQuery = query?.trim();
+
+  if (trimmedQuery) {
+    const facts = await withTenant(pool, ctx, fetchFacts);
+    const { hits } = await recall(pool, ctx, embedder ?? new NoOpEmbedder(), {
+      query: trimmedQuery,
+      limit: MEMORY_CANDIDATES,
+    });
+    const memories: RenderMemory[] = hits.map((h) => ({
+      content: h.content,
+      importance: h.importance,
+    }));
+    return renderContext(facts, memories, maxTokens);
+  }
+
   return withTenant(pool, ctx, async (client) => {
-    const facts = await client.query<FactRow>(
-      `SELECT id, workspace_id, user_id, scope, category, key, value, created_at, updated_at
-         FROM facts
-        ORDER BY category, key`,
-    );
+    const facts = await fetchFacts(client);
     const memories = await client.query<MemoryRow>(
       `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed
          FROM memories
@@ -38,7 +68,7 @@ export async function buildContext(
         LIMIT $1`,
       [MEMORY_CANDIDATES],
     );
-    return renderContext(facts.rows.map(rowToFact), memories.rows, maxTokens);
+    return renderContext(facts, memories.rows, maxTokens);
   });
 }
 

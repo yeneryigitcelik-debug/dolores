@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Fact } from "../types.js";
 import { renderContext } from "./context.js";
-import { fuseRrf } from "./rrf.js";
+import { type BoostableHit, applyBoost, fuseRrf } from "./rrf.js";
 import { clampImportance, toVectorLiteral } from "./sql.js";
 import { tokenEstimate } from "./tokens.js";
 
@@ -59,6 +59,47 @@ describe("fuseRrf", () => {
 
   it("respects limit", () => {
     expect(fuseRrf([["a", "b", "c", "d"]], { limit: 2 })).toHaveLength(2);
+  });
+});
+
+describe("applyBoost", () => {
+  const hit = (id: string, score: number, importance: number, ageMs = 0): BoostableHit => ({
+    id,
+    score,
+    importance,
+    ageMs,
+  });
+
+  it("breaks an RRF tie in favour of the more important memory", () => {
+    const out = applyBoost([hit("low", 1.0, 1), hit("high", 1.0, 10)]);
+    expect(out[0]?.id).toBe("high");
+    expect(out[1]?.id).toBe("low");
+  });
+
+  it("keeps scores normalised in 0..1", () => {
+    const out = applyBoost([hit("a", 1.0, 10, 0), hit("b", 0.5, 5, 0)]);
+    for (const h of out) {
+      expect(h.score).toBeGreaterThan(0);
+      expect(h.score).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("is a LIGHT nudge — a clearly more similar hit still wins despite low importance", () => {
+    // rrf gap is large (1.0 vs 0.6); importance must NOT override similarity.
+    const out = applyBoost([hit("similar", 1.0, 1), hit("important", 0.6, 10)]);
+    expect(out[0]?.id).toBe("similar");
+  });
+
+  it("breaks a tie in favour of the fresher memory (recency)", () => {
+    const day = 24 * 60 * 60 * 1000;
+    const out = applyBoost([hit("stale", 1.0, 5, 60 * day), hit("fresh", 1.0, 5, 0)]);
+    expect(out[0]?.id).toBe("fresh");
+  });
+
+  it("clamps out-of-range importance without throwing", () => {
+    const out = applyBoost([hit("x", 0.8, 99), hit("y", 0.8, -3)]);
+    expect(out[0]?.id).toBe("x"); // 99 → clamped to 10 beats -3 → clamped to 1
+    for (const h of out) expect(h.score).toBeLessThanOrEqual(1);
   });
 });
 

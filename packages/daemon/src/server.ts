@@ -52,6 +52,7 @@ const recallBodySchema = ctxSchema.extend({
 
 const contextBodySchema = ctxSchema.extend({
   maxTokens: z.number().int().min(1).optional(),
+  query: z.string().max(2_000).optional(),
 });
 
 const factsListBodySchema = ctxSchema.extend({
@@ -284,10 +285,12 @@ export async function createApp(
         },
       });
     }
-    const { workspaceId, userId, maxTokens } = parsed.data;
+    const { workspaceId, userId, maxTokens, query } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
-      const result = await buildContext(pool, ctx, maxTokens);
+      // query present → relevant-memory context (hybrid recall, uses the embedder);
+      // absent → static importance/recency blob.
+      const result = await buildContext(pool, ctx, maxTokens, query, embedder);
       return { text: result.text, tokenEstimate: result.tokenEstimate };
     } catch (err) {
       console.error("[dolores-daemon] /context error:", errMsg(err));

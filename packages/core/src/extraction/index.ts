@@ -8,7 +8,9 @@ export {
 } from "./extract.js";
 export {
   createOpenAiProvider,
+  createAnthropicProvider,
   createLlmProviderFromEnv,
   type LlmProvider,
   type OpenAiProviderOptions,
+  type AnthropicProviderOptions,
 } from "./provider.js";

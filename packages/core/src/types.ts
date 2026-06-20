@@ -156,6 +156,12 @@ export type RecallResponse = RecallResult;
 export interface ContextRequest extends MemoryContext {
   /** token budget for the rendered context blob, default ~600 */
   maxTokens?: number;
+  /**
+   * Optional task query. When set, the context is filled with the most RELEVANT
+   * memories (hybrid recall) for that query instead of just the most
+   * important/recent ones. Omit for a static identity blob.
+   */
+  query?: string;
 }
 export interface ContextResponse {
   /** ready-to-inject system-prompt text (facts + top memories) */

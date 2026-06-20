@@ -7,7 +7,7 @@ import type {
   RecallResult,
   Scope,
 } from "../types.js";
-import { fuseRrf } from "./rrf.js";
+import { type BoostableHit, applyBoost, fuseRrf } from "./rrf.js";
 import { type MemoryRow, toIso, toVectorLiteral } from "./sql.js";
 import { withTenant } from "./tenant.js";
 import { tokenEstimate } from "./tokens.js";
@@ -15,6 +15,19 @@ import { tokenEstimate } from "./tokens.js";
 const DEFAULT_LIMIT = 5;
 /** Postgres `regconfig` used for full-text. Matches the db migration's index. */
 const FT_CONFIG = "english";
+/**
+ * ivfflat.probes default. The db migration builds the index with lists=100, where
+ * the engine default of 1 probe scans a single cell → poor recall at this scale.
+ * 10 probes trade a little latency for materially better recall. Tunable via
+ * DOLORES_IVFFLAT_PROBES.
+ */
+const DEFAULT_IVFFLAT_PROBES = 10;
+
+function resolveIvfflatProbes(): number {
+  const raw = Number(process.env.DOLORES_IVFFLAT_PROBES);
+  if (Number.isFinite(raw) && raw >= 1) return Math.floor(raw);
+  return DEFAULT_IVFFLAT_PROBES;
+}
 
 /**
  * Hybrid recall: pgvector cosine + Postgres full-text, fused with RRF.
@@ -49,19 +62,41 @@ export async function recall(
   return withTenant(pool, ctx, async (client) => {
     const byId = new Map<string, MemoryRow>();
 
-    const vectorArm = vector ? await runVectorArm(client, vector, q, candidates, byId) : [];
-    const fullTextArm = await runFullTextArm(client, query, q, candidates, byId);
+    let vectorArm: string[] = [];
+    if (vector) {
+      // Raise ivfflat probes for THIS transaction only (SET LOCAL via set_config)
+      // so the index scans more cells → better recall (lists=100, engine default 1).
+      await client.query("SELECT set_config('ivfflat.probes', $1, true)", [
+        String(resolveIvfflatProbes()),
+      ]);
+      vectorArm = await runVectorArm(client, ctx.workspaceId, vector, q, candidates, byId);
+    }
+    const fullTextArm = await runFullTextArm(client, ctx.workspaceId, query, q, candidates, byId);
 
-    const fused = fuseRrf([vectorArm, fullTextArm], { limit });
+    // Fuse ALL candidates (no limit yet) so the importance/recency boost can
+    // participate in the final top-N selection, not just reorder a pre-cut slice.
+    const fused = fuseRrf([vectorArm, fullTextArm], {});
     if (fused.length === 0) return { hits: [], tokenEstimate: 0 };
+
+    const now = Date.now();
+    const boostable: BoostableHit[] = fused.map((f) => {
+      const row = byId.get(f.id);
+      return {
+        id: f.id,
+        score: f.score,
+        importance: row?.importance ?? 5,
+        ageMs: row ? now - new Date(row.last_accessed).getTime() : 0,
+      };
+    });
+    const ranked = applyBoost(boostable).slice(0, limit);
 
     // Recency bump for the rows we actually surface.
     await client.query("UPDATE memories SET last_accessed = now() WHERE id = ANY($1::uuid[])", [
-      fused.map((f) => f.id),
+      ranked.map((f) => f.id),
     ]);
 
     const hits: RecallHit[] = [];
-    for (const f of fused) {
+    for (const f of ranked) {
       const row = byId.get(f.id);
       if (!row) continue;
       hits.push({
@@ -80,9 +115,15 @@ export async function recall(
   });
 }
 
-/** Build the optional `scope` / `minImportance` filter shared by both arms. */
-function buildFilters(q: RecallQuery, params: unknown[]): string {
-  let sql = "";
+/**
+ * Build the filter shared by both arms. An explicit `workspace_id = $N` is added
+ * on top of RLS: defence-in-depth, and — crucially — it lets Postgres use the
+ * (workspace_id, ...) indexes instead of relying on the RLS predicate alone.
+ * Mirrors the explicit filter already used in remember.ts.
+ */
+function buildFilters(workspaceId: string, q: RecallQuery, params: unknown[]): string {
+  params.push(workspaceId);
+  let sql = ` AND workspace_id = $${params.length}`;
   if (q.scope) {
     params.push(q.scope);
     sql += ` AND scope = $${params.length}`;
@@ -96,13 +137,14 @@ function buildFilters(q: RecallQuery, params: unknown[]): string {
 
 async function runVectorArm(
   client: PoolClient,
+  workspaceId: string,
   vector: number[],
   q: RecallQuery,
   candidates: number,
   byId: Map<string, MemoryRow>,
 ): Promise<string[]> {
   const params: unknown[] = [toVectorLiteral(vector)];
-  const filters = buildFilters(q, params);
+  const filters = buildFilters(workspaceId, q, params);
   params.push(candidates);
   const res = await client.query<MemoryRow>(
     `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed
@@ -118,13 +160,14 @@ async function runVectorArm(
 
 async function runFullTextArm(
   client: PoolClient,
+  workspaceId: string,
   query: string,
   q: RecallQuery,
   candidates: number,
   byId: Map<string, MemoryRow>,
 ): Promise<string[]> {
   const params: unknown[] = [FT_CONFIG, query];
-  const filters = buildFilters(q, params);
+  const filters = buildFilters(workspaceId, q, params);
   params.push(candidates);
   const res = await client.query<MemoryRow>(
     `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed

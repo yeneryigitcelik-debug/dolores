@@ -78,13 +78,16 @@ program
 // context — POST /context  (pipe target for system prompts)
 // ---------------------------------------------------------------------------
 program
-  .command("context")
-  .description("System prompt'a inject edilecek bellek bloğunu stdout'a yaz (pipe edilebilir)")
+  .command("context [query]")
+  .description(
+    "System prompt'a inject edilecek bellek bloğunu stdout'a yaz (pipe edilebilir). " +
+      "[query] verilirse o göreve ALAKALI bellekler getirilir (hibrit recall).",
+  )
   .option("--max-tokens <n>", "token bütçesi (varsayılan: ~600)", (v: string) =>
     Number.parseInt(v, 10),
   )
-  .action(async (opts: { maxTokens?: number }) => {
-    await runContext(opts);
+  .action(async (query: string | undefined, opts: { maxTokens?: number }) => {
+    await runContext({ ...opts, query });
   });
 
 // ---------------------------------------------------------------------------
