@@ -1,6 +1,7 @@
 import {
   type ContextResponse,
   type DaemonConfig,
+  type DecayMode,
   type Embedder,
   type FactsListResponse,
   type FactsUpsertResponse,
@@ -77,9 +78,13 @@ const pruneBodySchema = ctxSchema.extend({
 // Prune helper (not in @dolores/core — daemon-only logic)
 // ---------------------------------------------------------------------------
 
-async function runConservativePrune(
+// conservative = soften only (importance GREATEST(1,importance-1)); NEVER delete.
+// aggressive   = soften + delete (importance<3 AND last_accessed 90d+).
+// dryRun reports REAL candidate counts without modifying any rows.
+async function runPrune(
   pool: Pool,
   ctx: MemoryContext,
+  mode: DecayMode,
   dryRun: boolean,
 ): Promise<{ softened: number; deleted: number }> {
   let softened = 0;
@@ -87,30 +92,34 @@ async function runConservativePrune(
 
   await withTenant(pool, ctx, async (client) => {
     if (dryRun) {
-      const [softenRes, deleteRes] = await Promise.all([
-        client.query<{ count: string }>(
-          `SELECT COUNT(*) AS count FROM memories
-           WHERE last_accessed < NOW() - INTERVAL '30 days' AND importance > 1`,
-        ),
-        client.query<{ count: string }>(
+      const softenRes = await client.query<{ count: string }>(
+        `SELECT COUNT(*) AS count FROM memories
+         WHERE last_accessed < NOW() - INTERVAL '30 days' AND importance > 1`,
+      );
+      softened = Number.parseInt(softenRes.rows[0]?.count ?? "0", 10);
+
+      if (mode === "aggressive") {
+        const deleteRes = await client.query<{ count: string }>(
           `SELECT COUNT(*) AS count FROM memories
            WHERE last_accessed < NOW() - INTERVAL '90 days' AND importance < 3`,
-        ),
-      ]);
-      softened = Number.parseInt(softenRes.rows[0]?.count ?? "0", 10);
-      deleted = Number.parseInt(deleteRes.rows[0]?.count ?? "0", 10);
+        );
+        deleted = Number.parseInt(deleteRes.rows[0]?.count ?? "0", 10);
+      }
     } else {
       const softenRes = await client.query(
         `UPDATE memories
            SET importance = GREATEST(1, importance - 1)
          WHERE last_accessed < NOW() - INTERVAL '30 days' AND importance > 1`,
       );
-      const deleteRes = await client.query(
-        `DELETE FROM memories
-         WHERE last_accessed < NOW() - INTERVAL '90 days' AND importance < 3`,
-      );
       softened = softenRes.rowCount ?? 0;
-      deleted = deleteRes.rowCount ?? 0;
+
+      if (mode === "aggressive") {
+        const deleteRes = await client.query(
+          `DELETE FROM memories
+           WHERE last_accessed < NOW() - INTERVAL '90 days' AND importance < 3`,
+        );
+        deleted = deleteRes.rowCount ?? 0;
+      }
     }
   });
 
@@ -125,6 +134,9 @@ export async function createApp(
   pool: Pool,
   embedder: Embedder,
   config: DaemonConfig,
+  // Optional superuser pool for /status global counts — bypasses RLS.
+  // Retrieval/recall/remember still use `pool` (app user + RLS).
+  adminPool?: Pool,
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
 
@@ -153,23 +165,38 @@ export async function createApp(
     let memories = 0;
     let facts = 0;
 
+    // Connectivity check uses the app pool (dolores_app + RLS).
     try {
       const client = await pool.connect();
       try {
         await client.query("SELECT 1");
         connected = true;
-        // Counts via raw client (no GUC → RLS returns 0, but confirms tables exist)
-        const [mr, fr] = await Promise.all([
-          client.query<{ count: string }>("SELECT COUNT(*) AS count FROM memories"),
-          client.query<{ count: string }>("SELECT COUNT(*) AS count FROM facts"),
-        ]);
-        memories = Number.parseInt(mr.rows[0]?.count ?? "0", 10);
-        facts = Number.parseInt(fr.rows[0]?.count ?? "0", 10);
       } finally {
         client.release();
       }
     } catch {
       connected = false;
+    }
+
+    // Global counts need the superuser adminPool to bypass RLS FORCE.
+    // dolores_app without a workspace GUC always sees 0 rows due to RLS.
+    // If adminPool is absent, counts stay at 0 (graceful degradation).
+    if (connected && adminPool) {
+      try {
+        const adminClient = await adminPool.connect();
+        try {
+          const [mr, fr] = await Promise.all([
+            adminClient.query<{ count: string }>("SELECT COUNT(*) AS count FROM memories"),
+            adminClient.query<{ count: string }>("SELECT COUNT(*) AS count FROM facts"),
+          ]);
+          memories = Number.parseInt(mr.rows[0]?.count ?? "0", 10);
+          facts = Number.parseInt(fr.rows[0]?.count ?? "0", 10);
+        } finally {
+          adminClient.release();
+        }
+      } catch {
+        // Admin pool query failed — counts stay at 0.
+      }
     }
 
     // rough token savings: avg ~50 tokens/memory vs 600-token context window
@@ -316,7 +343,7 @@ export async function createApp(
     const { workspaceId, userId, dryRun = false } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
-      const { softened, deleted } = await runConservativePrune(pool, ctx, dryRun);
+      const { softened, deleted } = await runPrune(pool, ctx, config.decayMode, dryRun);
       return { deleted, softened, dryRun };
     } catch (err) {
       return reply.status(500).send({
@@ -341,9 +368,14 @@ export async function startDaemon(config: DaemonConfig): Promise<void> {
 
   const pool = new Pool({ connectionString: config.databaseUrl });
 
-  const app = await createApp(pool, embedder, config);
+  // Superuser pool for /status global counts — reads DATABASE_URL which has
+  // BYPASSRLS / superuser privileges, unlike the app pool (dolores_app + RLS).
+  const adminUrl = process.env.DATABASE_URL;
+  const adminPool = adminUrl ? new Pool({ connectionString: adminUrl }) : undefined;
 
-  setupGracefulShutdown(app, pool, embedder);
+  const app = await createApp(pool, embedder, config, adminPool);
+
+  setupGracefulShutdown(app, pool, embedder, adminPool);
 
   await app.listen({ port: config.port, host: config.host });
   console.log(`[dolores-daemon] listening on ${config.host}:${config.port}`);
@@ -362,7 +394,12 @@ export async function startDaemon(config: DaemonConfig): Promise<void> {
  */
 type MaybeDisposable = { dispose?: () => void | Promise<void> };
 
-function setupGracefulShutdown(app: FastifyInstance, pool: Pool, embedder: Embedder): void {
+function setupGracefulShutdown(
+  app: FastifyInstance,
+  pool: Pool,
+  embedder: Embedder,
+  adminPool?: Pool,
+): void {
   let stopping = false;
 
   const stop = (signal: string) => {
@@ -387,8 +424,9 @@ function setupGracefulShutdown(app: FastifyInstance, pool: Pool, embedder: Embed
         // 2. Release native embedder resources (onnxruntime session) if the
         //    embedder supports it. No-op until @dolores/core adds dispose().
         await (embedder as Embedder & MaybeDisposable).dispose?.();
-        // 3. Close the DB pool.
+        // 3. Close DB pools (app pool first, then admin pool).
         await pool.end();
+        if (adminPool) await adminPool.end();
 
         clearTimeout(timer);
         console.log("[dolores-daemon] shutdown complete");

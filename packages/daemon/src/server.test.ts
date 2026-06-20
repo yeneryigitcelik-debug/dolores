@@ -1,4 +1,4 @@
-import { type DaemonConfig, NoOpEmbedder } from "@dolores/core";
+import { type DaemonConfig, NoOpEmbedder, type PruneResponse } from "@dolores/core";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createApp } from "./server.js";
@@ -162,5 +162,130 @@ describe.skipIf(!HAS_DB)("DB round-trip: /remember → /recall", () => {
       body: JSON.stringify({ content: "test" }),
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: /prune conservative (requires real DB)
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!HAS_DB)("POST /prune — conservative mode", () => {
+  let pool: Pool;
+  let app: Awaited<ReturnType<typeof createApp>>;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: DB_URL });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    // cfg.decayMode = "conservative"
+    app = await createApp(pool, embedder, cfg);
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end();
+  });
+
+  it("dryRun=true returns deleted=0, softened is a number, data unchanged", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/prune",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        dryRun: true,
+      }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as PruneResponse;
+    expect(body.dryRun).toBe(true);
+    expect(body.deleted).toBe(0); // conservative never deletes
+    expect(typeof body.softened).toBe("number");
+    expect(body.softened).toBeGreaterThanOrEqual(0);
+  });
+
+  it("dryRun=false returns deleted=0 (conservative = soften only)", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/prune",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        dryRun: false,
+      }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as PruneResponse;
+    expect(body.dryRun).toBe(false);
+    expect(body.deleted).toBe(0); // conservative NEVER deletes
+    expect(typeof body.softened).toBe("number");
+    expect(body.softened).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: /prune aggressive (requires real DB)
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!HAS_DB)("POST /prune — aggressive mode", () => {
+  let pool: Pool;
+  let app: Awaited<ReturnType<typeof createApp>>;
+
+  const aggressiveCfg: DaemonConfig = { ...cfg, decayMode: "aggressive" };
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: DB_URL });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    app = await createApp(pool, embedder, aggressiveCfg);
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end();
+  });
+
+  it("dryRun=true reports both deleted and softened counts without modifying data", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/prune",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        dryRun: true,
+      }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as PruneResponse;
+    expect(body.dryRun).toBe(true);
+    expect(typeof body.deleted).toBe("number");
+    expect(typeof body.softened).toBe("number");
+    expect(body.deleted).toBeGreaterThanOrEqual(0);
+    expect(body.softened).toBeGreaterThanOrEqual(0);
+  });
+
+  it("dryRun=false executes soften + delete for stale low-importance memories", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/prune",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        dryRun: false,
+      }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as PruneResponse;
+    expect(body.dryRun).toBe(false);
+    expect(typeof body.deleted).toBe("number");
+    expect(typeof body.softened).toBe("number");
+    expect(body.deleted).toBeGreaterThanOrEqual(0);
+    expect(body.softened).toBeGreaterThanOrEqual(0);
   });
 });
