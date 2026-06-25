@@ -31,7 +31,10 @@ console.log(hr("═"));
 console.log();
 console.log("  Loading local embedder (bge-small-en-v1.5)…");
 await embedder.ready();
-console.log("  Embedder ready.\n");
+console.log("  Embedder ready.");
+// Label the active vector index so ivfflat-vs-hnsw runs are comparable (EPIC I):
+// re-run `pnpm bench` with DOLORES_VECTOR_INDEX=hnsw to diff recall@k + latency.
+console.log(`  Vector index: ${process.env.DOLORES_VECTOR_INDEX ?? "ivfflat"}\n`);
 
 // ── 1. Token Savings ─────────────────────────────────────────────────────────
 console.log("  [1/2] Token Savings Benchmark");

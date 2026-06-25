@@ -10,7 +10,12 @@
 
 import { Pool } from "pg";
 import type { PoolClient } from "pg";
-import { AGGRESSIVE_DECAY_SQL, INIT_SQL } from "./migration.js";
+import {
+  AGGRESSIVE_DECAY_SQL,
+  INIT_SQL,
+  resolveVectorIndexKind,
+  vectorIndexSql,
+} from "./migration.js";
 
 export type { Pool, PoolClient };
 
@@ -50,7 +55,8 @@ export function getPool(): Pool {
  * Creates:
  *  - pgvector + pg_cron extensions
  *  - facts and memories tables
- *  - All indexes (IVFFlat, GIN, composite ranking)
+ *  - indexes (GIN, composite ranking, + the configured vector index:
+ *    ivfflat [default] or hnsw via DOLORES_VECTOR_INDEX)
  *  - HOT update optimization (fillfactor=80 on memories)
  *  - RLS policies with both USING and WITH CHECK clauses
  *  - SECURITY DEFINER decay functions (bypass FORCE RLS for pg_cron jobs)
@@ -64,6 +70,10 @@ export async function applyMigrations(pool: Pool): Promise<void> {
   try {
     await client.query("BEGIN");
     await client.query(INIT_SQL);
+    // Vector index (EPIC I): create the selected access method (ivfflat default |
+    // hnsw) and drop the other. Kept out of INIT_SQL so re-running with hnsw
+    // selected never rebuilds the ivfflat index, and vice-versa.
+    await client.query(vectorIndexSql(resolveVectorIndexKind()));
     // ALTER ROLE DDL does not accept $1 parameters through the wire protocol.
     // escapeLiteral() wraps the value in single quotes with proper escaping,
     // making this safe against SQL injection even for adversarial input.

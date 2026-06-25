@@ -36,6 +36,23 @@ function resolveIvfflatProbes(): number {
   return DEFAULT_IVFFLAT_PROBES;
 }
 
+/** Default hnsw.ef_search (pgvector's own default). Tunable via DOLORES_HNSW_EF_SEARCH. */
+const DEFAULT_HNSW_EF_SEARCH = 40;
+
+/**
+ * Which vector index the db was migrated with (EPIC I). Read here (not imported
+ * from @dolores/db — core must not depend on db) to pick the right query-time GUC.
+ */
+function resolveVectorIndexKind(): "ivfflat" | "hnsw" {
+  return process.env.DOLORES_VECTOR_INDEX === "hnsw" ? "hnsw" : "ivfflat";
+}
+
+function resolveHnswEfSearch(): number {
+  const raw = Number(process.env.DOLORES_HNSW_EF_SEARCH);
+  if (Number.isFinite(raw) && raw >= 1) return Math.floor(raw);
+  return DEFAULT_HNSW_EF_SEARCH;
+}
+
 /**
  * MMR diversity λ (EPIC H). 1 (default) = OFF (pure relevance, current behaviour).
  * <1 trades relevance for diversity so the top-N isn't near-duplicates.
@@ -107,11 +124,19 @@ export async function recall(
 
     let vectorArm: string[] = [];
     if (vector) {
-      // Raise ivfflat probes for THIS transaction only (SET LOCAL via set_config)
-      // so the index scans more cells → better recall (lists=100, engine default 1).
-      await client.query("SELECT set_config('ivfflat.probes', $1, true)", [
-        String(resolveIvfflatProbes()),
-      ]);
+      // Tune the ANN scan for THIS transaction only (SET LOCAL via set_config) so
+      // more of the index is searched → better recall. Which GUC depends on the
+      // index the db was built with (EPIC I); setting the "wrong" one is harmless
+      // (the planner ignores it). hnsw.ef_search ≈ ivfflat.probes in spirit.
+      if (resolveVectorIndexKind() === "hnsw") {
+        await client.query("SELECT set_config('hnsw.ef_search', $1, true)", [
+          String(resolveHnswEfSearch()),
+        ]);
+      } else {
+        await client.query("SELECT set_config('ivfflat.probes', $1, true)", [
+          String(resolveIvfflatProbes()),
+        ]);
+      }
       vectorArm = await runVectorArm(client, ctx.workspaceId, vector, q, candidates, byId, embById);
     }
     const fullTextArm = await runFullTextArm(

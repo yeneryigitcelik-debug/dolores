@@ -97,6 +97,47 @@ describe("applyMigrations", () => {
     await expect(applyMigrations(adminPool)).resolves.toBeUndefined();
   });
 
+  it("vector index follows DOLORES_VECTOR_INDEX (hnsw opt-in, idempotent, drops the other)", async () => {
+    if (skipIfNoDb()) return;
+    const KEY = "DOLORES_VECTOR_INDEX";
+    const saved = process.env[KEY];
+
+    const vectorMethods = async (): Promise<string[]> => {
+      const { rows } = await adminPool.query<{ method: string }>(
+        `SELECT am.amname AS method
+           FROM pg_class i
+           JOIN pg_index ix ON ix.indexrelid = i.oid
+           JOIN pg_class t  ON t.oid = ix.indrelid
+           JOIN pg_am am    ON am.oid = i.relam
+          WHERE t.relname = 'memories' AND am.amname IN ('ivfflat','hnsw')
+          ORDER BY am.amname`,
+      );
+      return rows.map((r) => r.method);
+    };
+
+    try {
+      // Default (ivfflat): the ivfflat index is present, hnsw absent.
+      process.env[KEY] = "ivfflat";
+      await applyMigrations(adminPool);
+      expect(await vectorMethods()).toEqual(["ivfflat"]);
+
+      // Switch to hnsw: hnsw built, ivfflat dropped.
+      process.env[KEY] = "hnsw";
+      await applyMigrations(adminPool);
+      expect(await vectorMethods()).toEqual(["hnsw"]);
+
+      // Re-apply with the same kind is a no-op (no rebuild, still just hnsw).
+      await applyMigrations(adminPool);
+      expect(await vectorMethods()).toEqual(["hnsw"]);
+    } finally {
+      // Restore the shared DB to the default ivfflat index.
+      process.env[KEY] = "ivfflat";
+      await applyMigrations(adminPool);
+      if (saved === undefined) delete process.env[KEY];
+      else process.env[KEY] = saved;
+    }
+  });
+
   it("dolores_app role exists", async () => {
     if (skipIfNoDb()) return;
     const { rows } = await adminPool.query<{ rolname: string }>(

@@ -90,6 +90,30 @@ Default recall and the static `/context` blob always show the **active** set onl
 
 ---
 
+## Vector Index (ivfflat vs hnsw)
+
+`DOLORES_VECTOR_INDEX` selects the pgvector access method for the `memories.embedding` column. `applyMigrations()` builds the selected index and drops the other (idempotent — re-running with the same kind never rebuilds).
+
+| Kind | Build | Query latency / recall | Memory | Best for |
+|---|---|---|---|---|
+| `ivfflat` (default) | fast | good with enough probes | low | small–medium corpora |
+| `hnsw` | slower | higher recall, lower latency at scale | higher | large corpora |
+
+Query-time recall/latency is tuned per kind: `DOLORES_IVFFLAT_PROBES` (ivfflat) or `DOLORES_HNSW_EF_SEARCH` (hnsw). recall sets the matching GUC automatically.
+
+**Switching kinds rebuilds the index.** `applyMigrations()` runs inside a transaction, so it uses a plain `CREATE INDEX` (table lock during build). On a large, live table prefer building out-of-band with `CREATE INDEX CONCURRENTLY` (cannot run in a transaction), then drop the old index:
+
+```sql
+-- hnsw, no long write-lock:
+CREATE INDEX CONCURRENTLY idx_memories_embedding_hnsw
+  ON memories USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+DROP INDEX CONCURRENTLY idx_memories_embedding;   -- the old ivfflat index
+```
+
+Then set `DOLORES_VECTOR_INDEX=hnsw` so recall uses `hnsw.ef_search`. Benchmark both with `pnpm bench` (the output labels the active index) to pick per your scale.
+
+---
+
 ## Daemon Environment Variables
 
 | Variable | Default | Description |
@@ -101,7 +125,9 @@ Default recall and the static `/context` blob always show the **active** set onl
 | `DOLORES_LOG_LEVEL` | `info` | Fastify log level (`trace` / `debug` / `info` / `warn` / `error`) |
 | `DOLORES_EMBED_MODEL` | `bge-small-en-v1.5` | fastembed model name (`bge-small-en-v1.5` = 384d CPU) |
 | `DOLORES_MODEL_CACHE` | `~/.dolores-models` | Where fastembed stores downloaded model weights |
+| `DOLORES_VECTOR_INDEX` | `ivfflat` | Vector index access method: `ivfflat` (default) or `hnsw` (pgvector ≥0.5). See Vector Index below |
 | `DOLORES_IVFFLAT_PROBES` | `10` | `ivfflat.probes` for pgvector ANN searches (higher = more accurate, slower) |
+| `DOLORES_HNSW_EF_SEARCH` | `40` | `hnsw.ef_search` when `DOLORES_VECTOR_INDEX=hnsw` (higher = more accurate, slower) |
 | `DOLORES_FUSION_VECTOR_WEIGHT` | `1` | RRF weight for the pgvector arm (bias the hybrid score toward semantic match) |
 | `DOLORES_FUSION_FT_WEIGHT` | `1` | RRF weight for the full-text arm (bias toward keyword match) |
 | `DOLORES_MMR_LAMBDA` | `1` | MMR diversity: `1` = pure relevance (off); `<1` trades relevance for diversity to avoid near-duplicate hits (pure math, no model) |

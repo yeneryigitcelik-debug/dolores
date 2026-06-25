@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **HNSW vector index option** (v0.4 EPIC I). `DOLORES_VECTOR_INDEX=hnsw` (pgvector
+  ≥0.5) builds an HNSW index instead of ivfflat — higher recall + lower latency at
+  scale. `applyMigrations()` builds the selected index and drops the other
+  (idempotent, no rebuild on re-run with the same kind). recall sets the matching
+  query-time GUC automatically: `DOLORES_IVFFLAT_PROBES` or `DOLORES_HNSW_EF_SEARCH`.
+  `pnpm bench` labels the active index so ivfflat-vs-hnsw runs are comparable.
+  Closes the last open "ivfflat vs hnsw" question. Default stays ivfflat.
 - **Retrieval ranking v2** (v0.3 EPIC H, partial). Recall stays LLM-free (pure
   SQL + vector + math):
   - **Tunable weighted fusion** — `DOLORES_FUSION_VECTOR_WEIGHT` /

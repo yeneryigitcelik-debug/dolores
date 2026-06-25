@@ -56,9 +56,9 @@ CREATE INDEX IF NOT EXISTS idx_facts_workspace_scope
 -- Indexes on memories
 CREATE INDEX IF NOT EXISTS idx_memories_workspace_scope
   ON memories (workspace_id, scope);
-CREATE INDEX IF NOT EXISTS idx_memories_embedding
-  ON memories USING ivfflat (embedding vector_cosine_ops)
-  WITH (lists = 100);
+-- The VECTOR index (ivfflat default | hnsw opt-in) is created separately by
+-- applyMigrations() from DOLORES_VECTOR_INDEX — see vectorIndexSql() below. It is
+-- NOT in INIT_SQL so re-running with hnsw selected never rebuilds the ivfflat one.
 CREATE INDEX IF NOT EXISTS idx_memories_content_tsv
   ON memories USING gin (content_tsv);
 -- Composite index covers buildContext/prune/decay ranking queries to avoid seq-scan.
@@ -221,3 +221,43 @@ SELECT cron.schedule(
   'SELECT dolores_decay_memories()'
 );
 `;
+
+/** Vector index access method (EPIC I). ivfflat = default; hnsw = pgvector ≥0.5. */
+export type VectorIndexKind = "ivfflat" | "hnsw";
+
+/** Resolve the vector index kind from DOLORES_VECTOR_INDEX (default ivfflat). */
+export function resolveVectorIndexKind(): VectorIndexKind {
+  return process.env.DOLORES_VECTOR_INDEX === "hnsw" ? "hnsw" : "ivfflat";
+}
+
+/**
+ * SQL that ensures the selected vector index exists and the OTHER one is dropped.
+ * Idempotent: CREATE ... IF NOT EXISTS never rebuilds on re-run with the same
+ * kind, and DROP ... IF EXISTS cleans up after a switch. Applied by
+ * applyMigrations() inside the migration transaction.
+ *
+ *  - ivfflat (lists=100): fast to build, good at small/medium scale.
+ *  - hnsw (m=16, ef_construction=64): higher recall + lower query latency at
+ *    scale, slower to build, more memory. Query-time recall is tuned via
+ *    hnsw.ef_search (see recall.ts / DOLORES_HNSW_EF_SEARCH).
+ *
+ * NOTE: switching kinds rebuilds the index. For large tables prefer
+ * `CREATE INDEX CONCURRENTLY` out-of-band (it cannot run in this transaction) —
+ * see docs/OPERATIONS.md.
+ */
+export function vectorIndexSql(kind: VectorIndexKind): string {
+  if (kind === "hnsw") {
+    return /* sql */ `
+CREATE INDEX IF NOT EXISTS idx_memories_embedding_hnsw
+  ON memories USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 64);
+DROP INDEX IF EXISTS idx_memories_embedding;
+`;
+  }
+  return /* sql */ `
+CREATE INDEX IF NOT EXISTS idx_memories_embedding
+  ON memories USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100);
+DROP INDEX IF EXISTS idx_memories_embedding_hnsw;
+`;
+}
