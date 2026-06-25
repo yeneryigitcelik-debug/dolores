@@ -631,6 +631,31 @@ describe("GET /metrics — shape", () => {
     expect(healthRoute?.count).toBeGreaterThanOrEqual(2);
     expect(typeof healthRoute?.avgMs).toBe("number");
   });
+
+  it("exposes percentiles + dedupRate (EPIC K)", async () => {
+    await app.inject({ method: "GET", url: "/health" });
+    const res = await app.inject({ method: "GET", url: "/metrics" });
+    const body = JSON.parse(res.body) as {
+      dedupRate: number;
+      routes: Record<string, { p50Ms: number; p95Ms: number; p99Ms: number; errors5xx: number }>;
+    };
+    expect(typeof body.dedupRate).toBe("number");
+    const health = body.routes["GET /health"];
+    expect(typeof health?.p50Ms).toBe("number");
+    expect(typeof health?.p95Ms).toBe("number");
+    expect(typeof health?.p99Ms).toBe("number");
+    expect(typeof health?.errors5xx).toBe("number");
+  });
+
+  it("/metrics/prometheus returns Prometheus exposition text", async () => {
+    await app.inject({ method: "GET", url: "/health" });
+    const res = await app.inject({ method: "GET", url: "/metrics/prometheus" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/plain");
+    expect(res.body).toContain("# TYPE dolores_requests_total counter");
+    expect(res.body).toContain("dolores_route_latency_ms{route=");
+    expect(res.body).toContain('quantile="0.95"');
+  });
 });
 
 describe("GET /metrics — auth when auth enabled", () => {

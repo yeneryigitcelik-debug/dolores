@@ -90,6 +90,36 @@ Default recall and the static `/context` blob always show the **active** set onl
 
 ---
 
+## Observability (EPIC K)
+
+The daemon exposes in-memory request metrics — no external egress (KVKK-clean):
+
+- **`GET /metrics`** (JSON): uptime, total requests, `dedupRate`, per-route
+  `count` / `avgMs` / `p50Ms` / `p95Ms` / `p99Ms` / `errors4xx` / `errors5xx`, DB
+  connectivity, and (with an admin pool) `queue` depth by ingest-job status.
+- **`GET /metrics/prometheus`**: the same data in Prometheus exposition format —
+  point a scraper at it. Metrics: `dolores_requests_total`, `dolores_dedup_rate`,
+  `dolores_route_latency_ms{route,quantile}`, `dolores_route_errors_total{route,class}`,
+  `dolores_ingest_jobs{status}`, `dolores_db_connected`, `dolores_uptime_seconds`.
+
+Both are auth-protected when `DOLORES_AUTH_TOKEN` is set (the `/health` route is the
+only exception). Percentiles are computed over a rolling window of the last 1024
+requests per route; counts/errors are all-time.
+
+**Load test.** `pnpm loadtest` drives `/recall` (or `/remember` / `mixed`) against a
+running daemon and reports p50/p95/p99, throughput, and error rate:
+
+```bash
+LOADTEST_CONCURRENCY=50 LOADTEST_DURATION_MS=20000 LOADTEST_OP=mixed pnpm loadtest
+```
+
+> Distributed tracing (OpenTelemetry/OTLP) is intentionally **not** bundled — it
+> needs heavy optional `@opentelemetry/*` deps and external egress, which is niche
+> for a localhost daemon. Metrics + structured pino logs cover local observability;
+> OTLP can be added later behind an opt-in flag.
+
+---
+
 ## Durable Ingest Queue (EPIC J)
 
 `POST /ingest` (and `dolores ingest`) no longer fire-and-forget. The text is persisted as a job in the `ingest_jobs` table and a background worker distils it asynchronously, so **work survives daemon restarts**. Poll progress with `POST /ingest/status` (`{ workspaceId, jobId }`).

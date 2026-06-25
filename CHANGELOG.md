@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Observability** (v0.4 EPIC K). Local, no external egress:
+  - Rich **`GET /metrics`** (JSON): per-route p50/p95/p99 latency (rolling 1024-req
+    window), 4xx/5xx counts, all-time totals, `dedupRate`, DB connectivity, and
+    ingest-queue depth by status.
+  - **`GET /metrics/prometheus`**: the same data in Prometheus exposition format.
+  - `pnpm loadtest` — a dependency-free load harness reporting p50/p95/p99,
+    throughput, and error rate against a running daemon.
+  - _(OpenTelemetry/OTLP tracing intentionally deferred — heavy optional deps +
+    external egress, niche for a localhost daemon. Metrics + pino logs cover it.)_
 - **Durable ingest queue** (v0.4 EPIC J). `/ingest` no longer fire-and-forgets:
   the text is persisted as a job in a Postgres-native queue and a background
   worker distils it asynchronously, so **work survives daemon restarts**.

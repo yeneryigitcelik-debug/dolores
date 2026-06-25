@@ -27,6 +27,7 @@ import Fastify, { type FastifyError, type FastifyInstance } from "fastify";
 import { Pool } from "pg";
 import { z } from "zod";
 import type { DaemonRuntimeConfig } from "./config.js";
+import { MetricsCollector, type RouteMetricView } from "./metrics.js";
 import { type IngestWorkerHandle, startIngestWorkers } from "./worker.js";
 
 // ---------------------------------------------------------------------------
@@ -146,9 +147,11 @@ async function runPrune(
 // In-memory metrics
 // ---------------------------------------------------------------------------
 
-interface RouteMetric {
-  count: number;
-  totalMs: number;
+interface QueueDepth {
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
 }
 
 // Local-only type — NOT added to @dolores/core/types.ts.
@@ -157,9 +160,90 @@ interface RouteMetric {
 interface MetricsPayload {
   uptimeSec: number;
   totalRequests: number;
-  routes: Record<string, { count: number; avgMs: number }>;
+  dedupRate: number;
+  routes: Record<string, RouteMetricView>;
   embedder: { ready: boolean };
   db: { connected: boolean };
+  /** ingest_jobs counts by status (EPIC J/K); absent without an admin pool. */
+  queue?: QueueDepth;
+}
+
+/** Global ingest_jobs counts by status. Needs the admin pool (bypasses RLS). */
+async function queueDepth(adminPool: Pool | undefined): Promise<QueueDepth | undefined> {
+  if (!adminPool) return undefined;
+  try {
+    const res = await adminPool.query<{ status: string; count: string }>(
+      "SELECT status, COUNT(*) AS count FROM ingest_jobs GROUP BY status",
+    );
+    const depth: QueueDepth = { pending: 0, running: 0, done: 0, failed: 0 };
+    for (const row of res.rows) {
+      if (row.status in depth) depth[row.status as keyof QueueDepth] = Number(row.count);
+    }
+    return depth;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Render a metrics snapshot as Prometheus exposition text (v0.0.4). */
+function renderPrometheus(m: MetricsPayload): string {
+  const esc = (s: string): string =>
+    s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+  const lines: string[] = [];
+  const gauge = (name: string, help: string, value: number): void => {
+    lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${value}`);
+  };
+
+  gauge("dolores_uptime_seconds", "Daemon uptime in seconds.", m.uptimeSec);
+  lines.push(
+    "# HELP dolores_requests_total Total HTTP requests since start.",
+    "# TYPE dolores_requests_total counter",
+    `dolores_requests_total ${m.totalRequests}`,
+  );
+  gauge("dolores_dedup_rate", "Fraction of /remember calls that deduped (0..1).", m.dedupRate);
+  gauge("dolores_db_connected", "Database connectivity (1=up, 0=down).", m.db.connected ? 1 : 0);
+
+  const routes = Object.entries(m.routes);
+  lines.push(
+    "# HELP dolores_route_requests_total Requests per route.",
+    "# TYPE dolores_route_requests_total counter",
+  );
+  for (const [route, v] of routes) {
+    lines.push(`dolores_route_requests_total{route="${esc(route)}"} ${v.count}`);
+  }
+  lines.push(
+    "# HELP dolores_route_latency_ms Route latency percentiles (ms).",
+    "# TYPE dolores_route_latency_ms gauge",
+  );
+  for (const [route, v] of routes) {
+    const r = esc(route);
+    lines.push(
+      `dolores_route_latency_ms{route="${r}",quantile="0.5"} ${v.p50Ms}`,
+      `dolores_route_latency_ms{route="${r}",quantile="0.95"} ${v.p95Ms}`,
+      `dolores_route_latency_ms{route="${r}",quantile="0.99"} ${v.p99Ms}`,
+    );
+  }
+  lines.push(
+    "# HELP dolores_route_errors_total Error responses per route by class.",
+    "# TYPE dolores_route_errors_total counter",
+  );
+  for (const [route, v] of routes) {
+    const r = esc(route);
+    lines.push(
+      `dolores_route_errors_total{route="${r}",class="4xx"} ${v.errors4xx}`,
+      `dolores_route_errors_total{route="${r}",class="5xx"} ${v.errors5xx}`,
+    );
+  }
+  if (m.queue) {
+    lines.push(
+      "# HELP dolores_ingest_jobs Ingest jobs by status.",
+      "# TYPE dolores_ingest_jobs gauge",
+    );
+    for (const status of ["pending", "running", "done", "failed"] as const) {
+      lines.push(`dolores_ingest_jobs{status="${status}"} ${m.queue[status]}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,20 +267,13 @@ export async function createApp(
 
   // ---------- Metrics state ----------
   const metricsStartedAt = Date.now();
-  let metricsTotal = 0;
-  const metricsRoutes = new Map<string, RouteMetric>();
+  const metrics = new MetricsCollector();
 
-  // Collect request count + latency for /metrics.
-  // Fastify's own pino logger already handles access logs automatically;
-  // this hook is for in-memory aggregation only.
+  // Collect request count + latency + errors for /metrics. Fastify's own pino
+  // logger already handles access logs; this hook is for in-memory aggregation.
   app.addHook("onResponse", (request, reply, done) => {
-    metricsTotal++;
     const routeKey = `${request.method} ${request.routeOptions.url}`;
-    const ms = reply.elapsedTime;
-    const slot = metricsRoutes.get(routeKey) ?? { count: 0, totalMs: 0 };
-    slot.count++;
-    slot.totalMs += ms;
-    metricsRoutes.set(routeKey, slot);
+    metrics.record(routeKey, reply.elapsedTime, reply.statusCode);
     done();
   });
 
@@ -299,7 +376,9 @@ export async function createApp(
     const { workspaceId, userId, content, scope, importance, source } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
-      return await remember(pool, ctx, embedder, { content, scope, importance, source });
+      const res = await remember(pool, ctx, embedder, { content, scope, importance, source });
+      metrics.recordRemember(res.deduped);
+      return res;
     } catch (err) {
       request.log.error({ err }, "/remember error");
       return reply.status(500).send({
@@ -498,12 +577,8 @@ export async function createApp(
     }
   });
 
-  // ---------- GET /metrics ----------
-  // Auth-protected when auth is enabled (onRequest hook covers all non-/health routes).
-  app.get("/metrics", async (): Promise<MetricsPayload> => {
-    const uptimeSec = Math.floor((Date.now() - metricsStartedAt) / 1000);
-
-    // Quick connectivity probe — same pattern as /status.
+  // Snapshot shared by the JSON + Prometheus metrics routes.
+  const buildMetrics = async (): Promise<MetricsPayload> => {
     let dbConnected = false;
     try {
       const client = await pool.connect();
@@ -516,22 +591,26 @@ export async function createApp(
     } catch {
       // pool unreachable — report false, don't throw
     }
-
-    const routes: MetricsPayload["routes"] = {};
-    for (const [route, m] of metricsRoutes) {
-      routes[route] = {
-        count: m.count,
-        avgMs: m.count > 0 ? Math.round(m.totalMs / m.count) : 0,
-      };
-    }
-
     return {
-      uptimeSec,
-      totalRequests: metricsTotal,
-      routes,
+      uptimeSec: Math.floor((Date.now() - metricsStartedAt) / 1000),
+      totalRequests: metrics.total,
+      dedupRate: Math.round(metrics.dedupRate() * 1000) / 1000,
+      routes: metrics.routeViews(),
       embedder: { ready: true },
       db: { connected: dbConnected },
+      queue: await queueDepth(adminPool),
     };
+  };
+
+  // ---------- GET /metrics (JSON) ----------
+  // Auth-protected when auth is enabled (onRequest hook covers all non-/health routes).
+  app.get("/metrics", async (): Promise<MetricsPayload> => buildMetrics());
+
+  // ---------- GET /metrics/prometheus (text exposition) ----------
+  app.get("/metrics/prometheus", async (_request, reply): Promise<string> => {
+    const snapshot = await buildMetrics();
+    reply.header("content-type", "text/plain; version=0.0.4; charset=utf-8");
+    return renderPrometheus(snapshot);
   });
 
   return app;

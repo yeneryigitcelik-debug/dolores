@@ -19,7 +19,8 @@
     "db:down": "docker compose down",
     "db:logs": "docker compose logs -f db",
     "bench": "DOLORES_MODEL_CACHE=packages/core/.dolores-models node_modules/.bin/tsx benchmarks/run.ts",
-    "bench:extraction": "node_modules/.bin/tsx benchmarks/extraction-eval.ts"
+    "bench:extraction": "node_modules/.bin/tsx benchmarks/extraction-eval.ts",
+    "loadtest": "node scripts/loadtest.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
