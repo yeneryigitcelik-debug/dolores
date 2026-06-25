@@ -6,6 +6,7 @@ import {
   type FactsUpsertResponse,
   type HealthResponse,
   type IngestResponse,
+  type IngestStatusResponse,
   type MemoryContext,
   type PruneResponse,
   type RecallResponse,
@@ -14,7 +15,8 @@ import {
   buildContext,
   createEmbedder,
   createReranker,
-  ingestText,
+  enqueueIngestJob,
+  getIngestJobStatus,
   listFacts,
   recall,
   remember,
@@ -25,6 +27,7 @@ import Fastify, { type FastifyError, type FastifyInstance } from "fastify";
 import { Pool } from "pg";
 import { z } from "zod";
 import type { DaemonRuntimeConfig } from "./config.js";
+import { type IngestWorkerHandle, startIngestWorkers } from "./worker.js";
 
 // ---------------------------------------------------------------------------
 // Zod schemas for request bodies
@@ -77,6 +80,10 @@ const factsUpsertBodySchema = ctxSchema.extend({
 const ingestBodySchema = ctxSchema.extend({
   text: z.string().min(1, "text must be non-empty").max(100_000),
   source: z.string().optional(),
+});
+
+const ingestStatusBodySchema = ctxSchema.extend({
+  jobId: z.string().uuid("jobId must be a UUID"),
 });
 
 const pruneBodySchema = ctxSchema.extend({
@@ -410,8 +417,8 @@ export async function createApp(
   });
 
   // ---------- POST /ingest ----------
-  // Fire-and-forget: respond 202 immediately, extraction runs async.
-  // Gracefully handles: extraction disabled, no provider, LLM errors.
+  // Durable enqueue (EPIC J): persist the text as a job and return 202 + jobId.
+  // A background worker distils it; survives daemon restarts (no work lost).
   app.post("/ingest", async (request, reply): Promise<IngestResponse | undefined> => {
     const parsed = ingestBodySchema.safeParse(request.body);
     if (!parsed.success) {
@@ -425,15 +432,45 @@ export async function createApp(
     }
     const { workspaceId, userId, text, source } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
+    try {
+      const jobId = await enqueueIngestJob(pool, ctx, { text, source });
+      return reply.status(202).send({ queued: true, jobId });
+    } catch (err) {
+      request.log.error({ err }, "/ingest error");
+      return reply.status(500).send({
+        error: { code: "INTERNAL", message: "An internal error occurred" },
+      });
+    }
+  });
 
-    void ingestText(pool, ctx, embedder, text, {
-      enabled: config.extractionEnabled,
-      source,
-    }).catch((err: unknown) => {
-      app.log.error({ err }, "ingest background error");
-    });
-
-    return reply.status(202).send({ queued: true });
+  // ---------- POST /ingest/status ----------
+  app.post("/ingest/status", async (request, reply): Promise<IngestStatusResponse | undefined> => {
+    const parsed = ingestStatusBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
+    }
+    const { workspaceId, userId, jobId } = parsed.data;
+    const ctx: MemoryContext = { workspaceId, userId };
+    try {
+      const status = await getIngestJobStatus(pool, ctx, jobId);
+      if (!status) {
+        return reply
+          .status(404)
+          .send({ error: { code: "NOT_FOUND", message: "ingest job not found" } });
+      }
+      return status;
+    } catch (err) {
+      request.log.error({ err }, "/ingest/status error");
+      return reply.status(500).send({
+        error: { code: "INTERNAL", message: "An internal error occurred" },
+      });
+    }
   });
 
   // ---------- POST /prune ----------
@@ -529,7 +566,16 @@ export async function startDaemon(config: DaemonRuntimeConfig): Promise<void> {
   await embedder.ready();
   app.log.info({ dim: embedder.dim }, "embedder ready");
 
-  setupGracefulShutdown(app, pool, embedder, adminPool);
+  // Durable ingest worker (EPIC J): drains the Postgres-native queue in the
+  // background. Started after the embedder is ready so jobs can be distilled.
+  const ingestWorker = await startIngestWorkers({
+    pool,
+    embedder,
+    extractionEnabled: config.extractionEnabled,
+    log: app.log,
+  });
+
+  setupGracefulShutdown(app, pool, embedder, ingestWorker, adminPool);
 
   await app.listen({ port: config.port, host: config.host });
   app.log.info(
@@ -555,6 +601,7 @@ function setupGracefulShutdown(
   app: FastifyInstance,
   pool: Pool,
   embedder: Embedder,
+  ingestWorker: IngestWorkerHandle,
   adminPool?: Pool,
 ): void {
   let stopping = false;
@@ -578,6 +625,9 @@ function setupGracefulShutdown(
         // 1. Stop accepting new connections and drain in-flight handlers so any
         //    ongoing embedder/ONNX ops finish before we tear anything down.
         await app.close();
+        // 1b. Stop the ingest worker — let a job mid-distillation finish, then
+        //     stop claiming, BEFORE the pool/embedder it uses are torn down.
+        await ingestWorker.stop();
         // 2. Release native embedder resources (onnxruntime session) if the
         //    embedder supports it. No-op until @dolores/core adds dispose().
         await (embedder as Embedder & MaybeDisposable).dispose?.();

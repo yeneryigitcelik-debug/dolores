@@ -205,6 +205,7 @@ export const DAEMON_ROUTES = {
   factsList: { method: "POST", path: "/facts/list" },
   factsUpsert: { method: "POST", path: "/facts/upsert" },
   ingest: { method: "POST", path: "/ingest" },
+  ingestStatus: { method: "POST", path: "/ingest/status" },
   prune: { method: "POST", path: "/prune" },
 } as const;
 
@@ -254,6 +255,22 @@ export interface IngestRequest extends MemoryContext {
 export interface IngestResponse {
   queued: boolean;
   jobId?: string;
+}
+
+/** Lifecycle of a durable ingest job (EPIC J). */
+export type IngestJobStatus = "pending" | "running" | "done" | "failed";
+
+export interface IngestStatusRequest extends MemoryContext {
+  jobId: string;
+}
+export interface IngestStatusResponse {
+  id: string;
+  status: IngestJobStatus;
+  attempts: number;
+  /** last failure message (null until a failure). */
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface PruneRequest extends MemoryContext {

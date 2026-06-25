@@ -87,6 +87,27 @@ CREATE INDEX IF NOT EXISTS idx_memories_active_ranking
   ON memories (workspace_id, importance DESC, last_accessed DESC)
   WHERE superseded_by IS NULL;
 
+-- Durable async ingest queue (EPIC J). Holds raw text to distil. payload is a
+-- TRANSIENT work buffer — PURGED (set NULL) the instant a job reaches a terminal
+-- state (done/failed), so dolores never becomes a chat-log store (rule 1). Only
+-- pending/running jobs hold payload; a pg_cron job deletes old terminal rows.
+CREATE TABLE IF NOT EXISTS ingest_jobs (
+  id           UUID        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+  workspace_id UUID        NOT NULL,
+  user_id      UUID,
+  status       TEXT        NOT NULL DEFAULT 'pending',  -- pending|running|done|failed
+  payload      TEXT,                                    -- raw text; purged on terminal
+  source       TEXT,
+  attempts     INT         NOT NULL DEFAULT 0,
+  last_error   TEXT,
+  run_after    TIMESTAMPTZ NOT NULL DEFAULT now(),      -- backoff gate for retries
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Claim index: pending jobs whose backoff has elapsed, oldest first.
+CREATE INDEX IF NOT EXISTS idx_ingest_jobs_claim
+  ON ingest_jobs (run_after, created_at) WHERE status = 'pending';
+
 -- RLS: memories (FORCE ensures table owner also complies, not just non-owners)
 -- CASE avoids ''::uuid cast error — PostgreSQL does not short-circuit AND in policies.
 -- DROP + CREATE for idempotency (PostgreSQL has no CREATE OR REPLACE POLICY).
@@ -158,6 +179,41 @@ CREATE POLICY facts_tenant_isolation ON facts
     )
   );
 
+-- RLS: ingest_jobs (same tenant-isolation pattern as memories/facts). The worker
+-- claims cross-tenant via the SECURITY DEFINER function below (bypasses RLS);
+-- enqueue / status / completion all run under the job's own tenant GUC.
+ALTER TABLE ingest_jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ingest_jobs FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS ingest_jobs_tenant_isolation ON ingest_jobs;
+CREATE POLICY ingest_jobs_tenant_isolation ON ingest_jobs
+  AS PERMISSIVE FOR ALL
+  USING (
+    workspace_id = CASE
+      WHEN nullif(current_setting('dolores.workspace_id', true), '') IS NOT NULL
+      THEN current_setting('dolores.workspace_id', true)::uuid
+    END
+    AND (
+      user_id IS NULL
+      OR user_id = CASE
+        WHEN nullif(current_setting('dolores.user_id', true), '') IS NOT NULL
+        THEN current_setting('dolores.user_id', true)::uuid
+      END
+    )
+  )
+  WITH CHECK (
+    workspace_id = CASE
+      WHEN nullif(current_setting('dolores.workspace_id', true), '') IS NOT NULL
+      THEN current_setting('dolores.workspace_id', true)::uuid
+    END
+    AND (
+      user_id IS NULL
+      OR user_id = CASE
+        WHEN nullif(current_setting('dolores.user_id', true), '') IS NOT NULL
+        THEN current_setting('dolores.user_id', true)::uuid
+      END
+    )
+  );
+
 -- Application role (non-superuser): daemon must connect as this user for RLS to apply.
 -- Superusers (POSTGRES_USER=dolores) bypass RLS even with FORCE ROW LEVEL SECURITY.
 -- Password is NOT set here — applyMigrations() sets it via DOLORES_APP_PASSWORD env var.
@@ -170,7 +226,7 @@ END;
 $$;
 GRANT CONNECT ON DATABASE dolores TO dolores_app;
 GRANT USAGE ON SCHEMA public TO dolores_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE memories, facts TO dolores_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE memories, facts, ingest_jobs TO dolores_app;
 
 -- SECURITY DEFINER decay functions: pg_cron jobs run without dolores.workspace_id GUC.
 -- FORCE ROW LEVEL SECURITY means even the scheduler role sees 0 rows via the policy
@@ -210,6 +266,72 @@ SELECT cron.schedule(
   'memory-soften',
   '0 3 * * *',
   'SELECT dolores_soften_memories()'
+);
+
+-- Ingest queue functions (EPIC J). SECURITY DEFINER so the daemon's app pool can
+-- claim/reclaim ACROSS tenants (the worker is tenant-agnostic) without a GUC,
+-- exactly like the decay jobs. Per-tenant work (enqueue, status, completion) runs
+-- under the job's own tenant GUC via RLS — only the cross-tenant scan bypasses it.
+
+-- Claim the next runnable job atomically: FOR UPDATE SKIP LOCKED lets many workers
+-- pull distinct jobs without blocking. Marks it running and bumps attempts.
+CREATE OR REPLACE FUNCTION dolores_claim_ingest_job()
+  RETURNS TABLE (id UUID, workspace_id UUID, user_id UUID, payload TEXT, source TEXT, attempts INT)
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public
+AS $$
+BEGIN
+  RETURN QUERY
+  UPDATE ingest_jobs j
+     SET status = 'running', attempts = j.attempts + 1, updated_at = now()
+   WHERE j.id = (
+     SELECT j2.id FROM ingest_jobs j2
+      WHERE j2.status = 'pending' AND j2.run_after <= now()
+      ORDER BY j2.run_after, j2.created_at
+      FOR UPDATE SKIP LOCKED
+      LIMIT 1
+   )
+  RETURNING j.id, j.workspace_id, j.user_id, j.payload, j.source, j.attempts;
+END;
+$$;
+
+-- Crash recovery: reset jobs stuck in 'running' (a previous daemon died mid-job)
+-- back to 'pending'. Called once on worker startup. Returns the count reclaimed.
+CREATE OR REPLACE FUNCTION dolores_reclaim_ingest_jobs()
+  RETURNS INT
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public
+AS $$
+DECLARE n INT;
+BEGIN
+  UPDATE ingest_jobs SET status = 'pending', updated_at = now() WHERE status = 'running';
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END;
+$$;
+
+-- Housekeeping: delete old terminal job rows (payload already purged on completion).
+CREATE OR REPLACE FUNCTION dolores_purge_ingest_jobs()
+  RETURNS void
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public
+AS $$
+BEGIN
+  DELETE FROM ingest_jobs
+   WHERE status IN ('done', 'failed') AND updated_at < now() - INTERVAL '7 days';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION dolores_claim_ingest_job() TO dolores_app;
+GRANT EXECUTE ON FUNCTION dolores_reclaim_ingest_jobs() TO dolores_app;
+
+SELECT cron.schedule(
+  'ingest-jobs-purge',
+  '0 5 * * *',
+  'SELECT dolores_purge_ingest_jobs()'
 );
 `;
 

@@ -1,4 +1,4 @@
-import { type DaemonConfig, NoOpEmbedder, type PruneResponse } from "@dolores/core";
+import { type DaemonConfig, NoOpEmbedder, type PruneResponse, withTenant } from "@dolores/core";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadConfig } from "./config.js";
@@ -500,24 +500,30 @@ describe("Error response schema", () => {
 // Suite: /ingest returns 202 Accepted
 // ---------------------------------------------------------------------------
 
-describe("POST /ingest → 202 Accepted", () => {
+describe.skipIf(!HAS_DB)("POST /ingest → 202 + jobId, /ingest/status", () => {
   let pool: Pool;
   let app: Awaited<ReturnType<typeof createApp>>;
 
   beforeAll(async () => {
-    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    pool = new Pool({ connectionString: DB_URL });
     const embedder = new NoOpEmbedder();
     await embedder.ready();
+    // createApp does NOT start the ingest worker, so jobs stay 'pending' here —
+    // which is exactly what lets us assert the enqueued state deterministically.
     app = await createApp(pool, embedder, cfg);
     await app.ready();
   });
 
   afterAll(async () => {
+    // Clean up the pending jobs this suite enqueued (no worker drained them).
+    await withTenant(pool, { workspaceId: TEST_WORKSPACE_ID }, (c) =>
+      c.query("DELETE FROM ingest_jobs WHERE workspace_id = $1", [TEST_WORKSPACE_ID]),
+    ).catch(() => undefined);
     await app.close();
     await pool.end().catch(() => undefined);
   });
 
-  it("returns 202 with { queued: true }", async () => {
+  it("enqueues and returns 202 { queued: true, jobId }", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/ingest",
@@ -529,8 +535,40 @@ describe("POST /ingest → 202 Accepted", () => {
       }),
     });
     expect(res.statusCode).toBe(202);
-    const body = JSON.parse(res.body) as { queued: boolean };
+    const body = JSON.parse(res.body) as { queued: boolean; jobId?: string };
     expect(body.queued).toBe(true);
+    expect(body.jobId).toMatch(/^[0-9a-f-]{36}$/);
+
+    // /ingest/status reflects the queued job (pending — no worker in createApp).
+    const statusRes = await app.inject({
+      method: "POST",
+      url: "/ingest/status",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        jobId: body.jobId,
+      }),
+    });
+    expect(statusRes.statusCode).toBe(200);
+    const status = JSON.parse(statusRes.body) as { id: string; status: string; attempts: number };
+    expect(status.id).toBe(body.jobId);
+    expect(status.status).toBe("pending");
+    expect(status.attempts).toBe(0);
+  });
+
+  it("/ingest/status returns 404 for an unknown jobId", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/ingest/status",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        jobId: "00000000-0000-0000-0000-0000000000ff",
+      }),
+    });
+    expect(res.statusCode).toBe(404);
   });
 });
 

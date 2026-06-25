@@ -51,3 +51,24 @@ model Memory {
   @@index([workspaceId, scope])
   @@map("memories")
 }
+
+/// Durable async ingest queue (EPIC J). `payload` is a TRANSIENT work buffer,
+/// purged the moment a job is terminal (done/failed) — never a chat-log store.
+/// RLS, the claim/reclaim/purge SECURITY DEFINER functions, and the purge cron
+/// are applied via raw SQL (see the db helper's migration).
+model IngestJob {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId String   @map("workspace_id") @db.Uuid
+  userId      String?  @map("user_id") @db.Uuid
+  status      String   @default("pending")
+  payload     String?
+  source      String?
+  attempts    Int      @default(0)
+  lastError   String?  @map("last_error")
+  runAfter    DateTime @default(now()) @map("run_after") @db.Timestamptz
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz
+
+  @@index([runAfter, createdAt])
+  @@map("ingest_jobs")
+}

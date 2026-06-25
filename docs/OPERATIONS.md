@@ -90,6 +90,18 @@ Default recall and the static `/context` blob always show the **active** set onl
 
 ---
 
+## Durable Ingest Queue (EPIC J)
+
+`POST /ingest` (and `dolores ingest`) no longer fire-and-forget. The text is persisted as a job in the `ingest_jobs` table and a background worker distils it asynchronously, so **work survives daemon restarts**. Poll progress with `POST /ingest/status` (`{ workspaceId, jobId }`).
+
+Lifecycle: `pending → running → done | failed`. A failed attempt is retried with exponential backoff up to `DOLORES_INGEST_MAX_ATTEMPTS`, then marked `failed`.
+
+**Privacy (rule 1):** `payload` (the raw text) is a transient work buffer — it is set `NULL` the instant a job reaches a terminal state (`done`/`failed`). dolores never becomes a chat-log store. A nightly `pg_cron` job (`ingest-jobs-purge`) deletes terminal job rows older than 7 days.
+
+**Concurrency & recovery:** workers claim jobs with `FOR UPDATE SKIP LOCKED` (a SECURITY DEFINER function, like the decay jobs — the worker is tenant-agnostic; per-tenant writes still run under RLS). Set `DOLORES_INGEST_WORKERS` > 1 to parallelise. On startup the worker reclaims any job stuck in `running` from a crashed run (back to `pending`). Assumes a single daemon owns the queue (architecture rule 4).
+
+---
+
 ## Vector Index (ivfflat vs hnsw)
 
 `DOLORES_VECTOR_INDEX` selects the pgvector access method for the `memories.embedding` column. `applyMigrations()` builds the selected index and drops the other (idempotent — re-running with the same kind never rebuilds).
@@ -135,6 +147,9 @@ Then set `DOLORES_VECTOR_INDEX=hnsw` so recall uses `hnsw.ef_search`. Benchmark 
 | `DOLORES_DECAY_MODE` | `conservative` | `conservative` (soften) or `aggressive` (delete) — see Decay Modes above |
 | `DOLORES_EVOLUTION_MODE` | `inplace` | `inplace` (overwrite) or `versioned` (keep history for `asOf` recall) — see Memory Evolution above |
 | `DOLORES_EXTRACTION_MODEL` | — | LLM model ID used for async fact extraction (`ingest` command) |
+| `DOLORES_INGEST_WORKERS` | `1` | Concurrent ingest worker loops draining the durable queue |
+| `DOLORES_INGEST_POLL_MS` | `1000` | Worker idle poll interval (ms) |
+| `DOLORES_INGEST_MAX_ATTEMPTS` | `3` | Retries (exponential backoff) before a job is marked `failed` |
 | `DOLORES_EXTRACTION_MIN_CONFIDENCE` | `0` | Drop extracted items whose model-reported confidence is below this (0..1); confidence-less items always kept |
 | `DOLORES_EXTRACTION_MAX_FACTS` | `20` | Maximum facts extracted per `ingest` call |
 | `DOLORES_EXTRACTION_TIMEOUT_MS` | `30000` | Timeout for a single extraction LLM call (ms) |

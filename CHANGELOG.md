@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Durable ingest queue** (v0.4 EPIC J). `/ingest` no longer fire-and-forgets:
+  the text is persisted as a job in a Postgres-native queue and a background
+  worker distils it asynchronously, so **work survives daemon restarts**.
+  - `POST /ingest` returns `{ queued, jobId }`; new `POST /ingest/status` polls a
+    job (`pending → running → done | failed`).
+  - Workers claim jobs with `FOR UPDATE SKIP LOCKED` (SECURITY DEFINER, like the
+    decay jobs); per-tenant writes still run under RLS. `DOLORES_INGEST_WORKERS`,
+    `DOLORES_INGEST_POLL_MS`, `DOLORES_INGEST_MAX_ATTEMPTS` (exponential backoff).
+  - **Privacy (rule 1):** `payload` is purged the instant a job is terminal; a
+    nightly `pg_cron` job deletes old terminal rows. dolores never stores raw text.
+  - On startup the worker reclaims jobs stuck in `running` from a crashed run.
 - **HNSW vector index option** (v0.4 EPIC I). `DOLORES_VECTOR_INDEX=hnsw` (pgvector
   ≥0.5) builds an HNSW index instead of ivfflat — higher recall + lower latency at
   scale. `applyMigrations()` builds the selected index and drops the other
