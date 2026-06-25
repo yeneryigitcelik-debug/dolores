@@ -5,6 +5,7 @@ export {
   type ExtractionOptions,
   type ExtractionResult,
   type IngestSummary,
+  type KnownFact,
 } from "./extract.js";
 export {
   createOpenAiProvider,

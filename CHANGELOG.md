@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Extraction quality v2** (v0.3 EPIC G). The async distiller is more robust and
+  measurable, still off the critical path:
+  - **Per-item validation** — one malformed fact/memory no longer drops the whole
+    payload; valid items survive.
+  - **Confidence gating** — items may carry a `confidence` (0..1); set
+    `DOLORES_EXTRACTION_MIN_CONFIDENCE` to drop low-confidence ones (default 0 =
+    keep all; confidence-less items always kept).
+  - **Contradiction-aware** — `ingestText` feeds the tenant's existing facts into
+    the prompt so the model reuses the SAME category+key on an update (→ upsert
+    overwrites instead of creating a near-duplicate). Stronger few-shot prompt.
+  - **Extraction eval harness** — `pnpm bench:extraction` scores fact/memory
+    recall + ephemeral-discipline on labelled fixtures (skips without an API key).
 - **Temporal memory evolution** (v0.3 EPIC F). A near-duplicate write can now
   *supersede* the old memory instead of silently overwriting it:
   - `DOLORES_EVOLUTION_MODE=versioned` keeps history — the old row is chained

@@ -105,6 +105,7 @@ Default recall and the static `/context` blob always show the **active** set onl
 | `DOLORES_DECAY_MODE` | `conservative` | `conservative` (soften) or `aggressive` (delete) — see Decay Modes above |
 | `DOLORES_EVOLUTION_MODE` | `inplace` | `inplace` (overwrite) or `versioned` (keep history for `asOf` recall) — see Memory Evolution above |
 | `DOLORES_EXTRACTION_MODEL` | — | LLM model ID used for async fact extraction (`ingest` command) |
+| `DOLORES_EXTRACTION_MIN_CONFIDENCE` | `0` | Drop extracted items whose model-reported confidence is below this (0..1); confidence-less items always kept |
 | `DOLORES_EXTRACTION_MAX_FACTS` | `20` | Maximum facts extracted per `ingest` call |
 | `DOLORES_EXTRACTION_TIMEOUT_MS` | `30000` | Timeout for a single extraction LLM call (ms) |
 | `WORKSPACE_ID` | — | Default workspace UUID for CLI operations |
