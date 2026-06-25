@@ -15,6 +15,14 @@ export type Scope = "personal" | "workspace";
 /** Decay policy. conservative = soften only; aggressive = pg_cron deletes. */
 export type DecayMode = "conservative" | "aggressive";
 
+/**
+ * Memory evolution policy on near-duplicate write (EPIC F).
+ *  - inplace   : overwrite the existing row (default; no history, least storage).
+ *  - versioned : insert a fresh active row and mark the old one superseded
+ *                (keeps history → `asOf` point-in-time recall works).
+ */
+export type EvolutionMode = "inplace" | "versioned";
+
 /** Structured-fact category. Free-form, but these are the conventional ones. */
 export type FactCategory = "stack" | "preference" | "project" | "decision";
 
@@ -42,6 +50,13 @@ export interface Memory {
   source: string | null;
   createdAt: string;
   lastAccessed: string;
+  // --- Temporal evolution (EPIC F) ---
+  /** id of the memory that replaced this one; null = active (current). */
+  supersededBy: string | null;
+  /** when this statement became true. */
+  validFrom: string;
+  /** when it stopped being true (set on supersede); null = still true. */
+  validTo: string | null;
 }
 
 /** Identity passed with every request — RLS isolation key. */
@@ -79,6 +94,39 @@ export interface Embedder {
 export type EmbedderKind = "local" | "openai" | "noop";
 
 // ---------------------------------------------------------------------------
+// Reranker abstraction (optional final-stage re-ranking — EPIC H)
+// ---------------------------------------------------------------------------
+
+/** A candidate handed to a Reranker: id + content + the current hybrid score. */
+export interface RerankCandidate {
+  id: string;
+  content: string;
+  /** Current hybrid (fused + boosted) score, 0..1, before reranking. */
+  score: number;
+}
+
+/**
+ * Optional final-stage reranker. Reorders the candidate pool by query relevance
+ * after hybrid fusion. MUST be LOCAL — a CPU model or pure heuristic, NEVER a
+ * network LLM — so recall stays off the critical LLM path. Default is the
+ * identity NoOpReranker; a concrete local cross-encoder can be plugged in via
+ * createReranker (see `@dolores/core` rerank/).
+ */
+export interface Reranker {
+  /** Stable id, e.g. "noop" | "local:bge-reranker-base". */
+  readonly id: string;
+  /** Return the candidates reordered (and optionally re-scored) for `query`. */
+  rerank(query: string, candidates: RerankCandidate[]): Promise<RerankCandidate[]>;
+  /** Warm up / load the model once. Optional. */
+  ready?(): Promise<void>;
+  /** Release native resources before exit. Optional. */
+  dispose?(): Promise<void>;
+}
+
+/** Only "noop" exists today; the extension point for a local cross-encoder. */
+export type RerankerKind = "noop";
+
+// ---------------------------------------------------------------------------
 // Retrieval / write inputs
 // ---------------------------------------------------------------------------
 
@@ -100,6 +148,17 @@ export interface RecallQuery {
   scope?: Scope;
   /** 1..10 floor */
   minImportance?: number;
+  /**
+   * Point-in-time recall (EPIC F): return the version of each memory that was
+   * valid at this ISO timestamp (valid_from <= asOf < valid_to). Implies
+   * searching superseded rows, since historical versions carry a valid_to.
+   */
+  asOf?: string;
+  /**
+   * Include superseded (historical) memories in the result. Ignored when `asOf`
+   * is set (asOf already selects by validity window). Default false = active only.
+   */
+  includeSuperseded?: boolean;
 }
 
 export interface RecallHit {
@@ -111,6 +170,12 @@ export interface RecallHit {
   score: number;
   source: string | null;
   createdAt: string;
+  /**
+   * id of the memory that superseded this one; null = active. Populated so
+   * `asOf` / `includeSuperseded` callers can tell historical hits from current
+   * ones. Omitted/null on the default (active-only) path.
+   */
+  supersededBy?: string | null;
 }
 
 export interface RecallResult {
@@ -140,7 +205,9 @@ export const DAEMON_ROUTES = {
   factsList: { method: "POST", path: "/facts/list" },
   factsUpsert: { method: "POST", path: "/facts/upsert" },
   ingest: { method: "POST", path: "/ingest" },
+  ingestStatus: { method: "POST", path: "/ingest/status" },
   prune: { method: "POST", path: "/prune" },
+  consolidate: { method: "POST", path: "/consolidate" },
 } as const;
 
 export interface RememberRequest extends MemoryContext, RememberInput {}
@@ -191,6 +258,22 @@ export interface IngestResponse {
   jobId?: string;
 }
 
+/** Lifecycle of a durable ingest job (EPIC J). */
+export type IngestJobStatus = "pending" | "running" | "done" | "failed";
+
+export interface IngestStatusRequest extends MemoryContext {
+  jobId: string;
+}
+export interface IngestStatusResponse {
+  id: string;
+  status: IngestJobStatus;
+  attempts: number;
+  /** last failure message (null until a failure). */
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface PruneRequest extends MemoryContext {
   dryRun?: boolean;
 }
@@ -198,6 +281,23 @@ export interface PruneResponse {
   deleted: number;
   softened: number;
   dryRun: boolean;
+}
+
+/** Result of a consolidation run (EPIC L). */
+export interface ConsolidationSummary {
+  candidates: number;
+  clusters: number;
+  /** clusters that produced a consolidated memory. */
+  consolidated: number;
+  /** member memories superseded into a consolidation. */
+  superseded: number;
+}
+export interface ConsolidateRequest extends MemoryContext {
+  scope?: Scope;
+}
+export interface ConsolidateResponse extends ConsolidationSummary {
+  /** false when DOLORES_CONSOLIDATION_MODE is off (the run is a no-op). */
+  enabled: boolean;
 }
 
 export interface HealthResponse {

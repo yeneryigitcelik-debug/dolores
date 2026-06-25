@@ -1,20 +1,27 @@
 import type { Pool, PoolClient } from "pg";
+import { NoOpReranker } from "../rerank/noop.js";
 import type {
   Embedder,
   MemoryContext,
   RecallHit,
   RecallQuery,
   RecallResult,
+  RerankCandidate,
+  Reranker,
   Scope,
 } from "../types.js";
+import { mmrSelect } from "./mmr.js";
 import { type BoostableHit, applyBoost, fuseRrf } from "./rrf.js";
-import { type MemoryRow, toIso, toVectorLiteral } from "./sql.js";
+import { type MemoryRow, parseVectorLiteral, toIso, toVectorLiteral } from "./sql.js";
 import { withTenant } from "./tenant.js";
 import { tokenEstimate } from "./tokens.js";
 
 const DEFAULT_LIMIT = 5;
 /** Postgres `regconfig` used for full-text. Matches the db migration's index. */
 const FT_CONFIG = "english";
+/** Columns both arms project (shared so the two SELECTs can't drift). */
+const MEMORY_COLS =
+  "id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed, superseded_by, valid_from, valid_to";
 /**
  * ivfflat.probes default. The db migration builds the index with lists=100, where
  * the engine default of 1 probe scans a single cell → poor recall at this scale.
@@ -29,6 +36,50 @@ function resolveIvfflatProbes(): number {
   return DEFAULT_IVFFLAT_PROBES;
 }
 
+/** Default hnsw.ef_search (pgvector's own default). Tunable via DOLORES_HNSW_EF_SEARCH. */
+const DEFAULT_HNSW_EF_SEARCH = 40;
+
+/**
+ * Which vector index the db was migrated with (EPIC I). Read here (not imported
+ * from @dolores/db — core must not depend on db) to pick the right query-time GUC.
+ */
+function resolveVectorIndexKind(): "ivfflat" | "hnsw" {
+  return process.env.DOLORES_VECTOR_INDEX === "hnsw" ? "hnsw" : "ivfflat";
+}
+
+function resolveHnswEfSearch(): number {
+  const raw = Number(process.env.DOLORES_HNSW_EF_SEARCH);
+  if (Number.isFinite(raw) && raw >= 1) return Math.floor(raw);
+  return DEFAULT_HNSW_EF_SEARCH;
+}
+
+/**
+ * MMR diversity λ (EPIC H). 1 (default) = OFF (pure relevance, current behaviour).
+ * <1 trades relevance for diversity so the top-N isn't near-duplicates.
+ */
+function resolveMmrLambda(): number {
+  const raw = Number(process.env.DOLORES_MMR_LAMBDA);
+  if (!Number.isFinite(raw) || raw >= 1) return 1;
+  return Math.max(0, raw);
+}
+
+interface FusionWeights {
+  vector: number;
+  fullText: number;
+}
+
+/** Per-arm RRF weights (EPIC H). Default 1 each = classic equal-weight RRF. */
+function resolveFusionWeights(): FusionWeights {
+  const w = (name: string): number => {
+    const raw = Number(process.env[name]);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 1;
+  };
+  return {
+    vector: w("DOLORES_FUSION_VECTOR_WEIGHT"),
+    fullText: w("DOLORES_FUSION_FT_WEIGHT"),
+  };
+}
+
 /**
  * Hybrid recall: pgvector cosine + Postgres full-text, fused with RRF.
  *
@@ -41,6 +92,7 @@ export async function recall(
   ctx: MemoryContext,
   embedder: Embedder,
   q: RecallQuery,
+  reranker: Reranker = new NoOpReranker(),
 ): Promise<RecallResult> {
   const query = q.query.trim();
   const limit = q.limit && q.limit > 0 ? q.limit : DEFAULT_LIMIT;
@@ -48,6 +100,9 @@ export async function recall(
 
   // Pull a wider candidate pool per arm so RRF has room to fuse.
   const candidates = Math.min(Math.max(limit * 4, 20), 100);
+
+  const lambda = resolveMmrLambda();
+  const weights = resolveFusionWeights();
 
   let vector: number[] | null = null;
   if (embedder.dim > 0) {
@@ -59,23 +114,46 @@ export async function recall(
     }
   }
 
+  // MMR needs candidate vectors AND an embedding space to compare in; with the
+  // noop/full-text-only path there is nothing to diversify against, so skip it.
+  const useMmr = lambda < 1 && vector !== null;
+
   return withTenant(pool, ctx, async (client) => {
     const byId = new Map<string, MemoryRow>();
+    const embById = useMmr ? new Map<string, number[]>() : null;
 
     let vectorArm: string[] = [];
     if (vector) {
-      // Raise ivfflat probes for THIS transaction only (SET LOCAL via set_config)
-      // so the index scans more cells → better recall (lists=100, engine default 1).
-      await client.query("SELECT set_config('ivfflat.probes', $1, true)", [
-        String(resolveIvfflatProbes()),
-      ]);
-      vectorArm = await runVectorArm(client, ctx.workspaceId, vector, q, candidates, byId);
+      // Tune the ANN scan for THIS transaction only (SET LOCAL via set_config) so
+      // more of the index is searched → better recall. Which GUC depends on the
+      // index the db was built with (EPIC I); setting the "wrong" one is harmless
+      // (the planner ignores it). hnsw.ef_search ≈ ivfflat.probes in spirit.
+      if (resolveVectorIndexKind() === "hnsw") {
+        await client.query("SELECT set_config('hnsw.ef_search', $1, true)", [
+          String(resolveHnswEfSearch()),
+        ]);
+      } else {
+        await client.query("SELECT set_config('ivfflat.probes', $1, true)", [
+          String(resolveIvfflatProbes()),
+        ]);
+      }
+      vectorArm = await runVectorArm(client, ctx.workspaceId, vector, q, candidates, byId, embById);
     }
-    const fullTextArm = await runFullTextArm(client, ctx.workspaceId, query, q, candidates, byId);
+    const fullTextArm = await runFullTextArm(
+      client,
+      ctx.workspaceId,
+      query,
+      q,
+      candidates,
+      byId,
+      embById,
+    );
 
     // Fuse ALL candidates (no limit yet) so the importance/recency boost can
     // participate in the final top-N selection, not just reorder a pre-cut slice.
-    const fused = fuseRrf([vectorArm, fullTextArm], {});
+    const fused = fuseRrf([vectorArm, fullTextArm], {
+      weights: [weights.vector, weights.fullText],
+    });
     if (fused.length === 0) return { hits: [], tokenEstimate: 0 };
 
     const now = Date.now();
@@ -88,12 +166,35 @@ export async function recall(
         ageMs: row ? now - new Date(row.last_accessed).getTime() : 0,
       };
     });
-    const ranked = applyBoost(boostable).slice(0, limit);
+    const boosted = applyBoost(boostable);
 
-    // Recency bump for the rows we actually surface.
-    await client.query("UPDATE memories SET last_accessed = now() WHERE id = ANY($1::uuid[])", [
-      ranked.map((f) => f.id),
-    ]);
+    // Optional final-stage reranker (EPIC H). NoOp default = identity, so this is
+    // a no-op unless a concrete LOCAL reranker is plugged in — never an LLM here.
+    const reordered = await applyReranker(reranker, query, boosted, byId);
+
+    // MMR diversity (EPIC H) when enabled; otherwise a pure-relevance slice
+    // (identical to the pre-MMR behaviour).
+    const ranked: { id: string; score: number }[] = embById
+      ? mmrSelect(
+          reordered.map((b) => ({
+            id: b.id,
+            score: b.score,
+            embedding: embById.get(b.id) ?? null,
+          })),
+          lambda,
+          limit,
+        )
+      : reordered.slice(0, limit);
+
+    // Recency bump for the rows we actually surface — but ONLY on the default
+    // active recall. A point-in-time (asOf) or includeSuperseded query is
+    // read-only introspection; bumping last_accessed there would pollute the
+    // live recency signal that decay/ranking rely on.
+    if (!q.asOf && !q.includeSuperseded) {
+      await client.query("UPDATE memories SET last_accessed = now() WHERE id = ANY($1::uuid[])", [
+        ranked.map((f) => f.id),
+      ]);
+    }
 
     const hits: RecallHit[] = [];
     for (const f of ranked) {
@@ -107,6 +208,7 @@ export async function recall(
         score: f.score,
         source: row.source,
         createdAt: toIso(row.created_at),
+        supersededBy: row.superseded_by ?? null,
       });
     }
 
@@ -132,7 +234,35 @@ function buildFilters(workspaceId: string, q: RecallQuery, params: unknown[]): s
     params.push(q.minImportance);
     sql += ` AND importance >= $${params.length}`;
   }
+  // Temporal evolution (EPIC F).
+  if (q.asOf) {
+    // Point-in-time: the version whose validity window contains asOf. This spans
+    // superseded rows on purpose (historical versions carry a closed valid_to).
+    params.push(q.asOf);
+    sql += ` AND valid_from <= $${params.length}::timestamptz`;
+    params.push(q.asOf);
+    sql += ` AND (valid_to IS NULL OR valid_to > $${params.length}::timestamptz)`;
+  } else if (!q.includeSuperseded) {
+    // Default: active set only — hide memories that have been superseded.
+    sql += " AND superseded_by IS NULL";
+  }
   return sql;
+}
+
+/** Column list, plus `embedding::text` when MMR needs candidate vectors. */
+type ArmRow = MemoryRow & { emb?: string | null };
+function armCols(embById: Map<string, number[]> | null): string {
+  return embById ? `${MEMORY_COLS}, embedding::text AS emb` : MEMORY_COLS;
+}
+function collect(
+  rows: ArmRow[],
+  byId: Map<string, MemoryRow>,
+  embById: Map<string, number[]> | null,
+) {
+  for (const row of rows) {
+    byId.set(row.id, row);
+    if (embById && row.emb) embById.set(row.id, parseVectorLiteral(row.emb));
+  }
 }
 
 async function runVectorArm(
@@ -142,19 +272,20 @@ async function runVectorArm(
   q: RecallQuery,
   candidates: number,
   byId: Map<string, MemoryRow>,
+  embById: Map<string, number[]> | null,
 ): Promise<string[]> {
   const params: unknown[] = [toVectorLiteral(vector)];
   const filters = buildFilters(workspaceId, q, params);
   params.push(candidates);
-  const res = await client.query<MemoryRow>(
-    `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed
+  const res = await client.query<ArmRow>(
+    `SELECT ${armCols(embById)}
        FROM memories
       WHERE embedding IS NOT NULL${filters}
       ORDER BY embedding <=> $1::vector
       LIMIT $${params.length}`,
     params,
   );
-  for (const row of res.rows) byId.set(row.id, row);
+  collect(res.rows, byId, embById);
   return res.rows.map((r) => r.id);
 }
 
@@ -165,20 +296,43 @@ async function runFullTextArm(
   q: RecallQuery,
   candidates: number,
   byId: Map<string, MemoryRow>,
+  embById: Map<string, number[]> | null,
 ): Promise<string[]> {
   const params: unknown[] = [FT_CONFIG, query];
   const filters = buildFilters(workspaceId, q, params);
   params.push(candidates);
-  const res = await client.query<MemoryRow>(
-    `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed
+  const res = await client.query<ArmRow>(
+    `SELECT ${armCols(embById)}
        FROM memories
       WHERE content_tsv @@ plainto_tsquery($1, $2)${filters}
       ORDER BY ts_rank(content_tsv, plainto_tsquery($1, $2)) DESC
       LIMIT $${params.length}`,
     params,
   );
-  for (const row of res.rows) byId.set(row.id, row);
+  collect(res.rows, byId, embById);
   return res.rows.map((r) => r.id);
+}
+
+/**
+ * Run the reranker over the boosted candidates. NoOp (the default) short-circuits
+ * to the input order with zero overhead. A concrete reranker receives
+ * {id, content, score} and returns a reordered (optionally re-scored) list, which
+ * we map back to the {id, score} shape the downstream MMR/slice expects.
+ */
+async function applyReranker(
+  reranker: Reranker,
+  query: string,
+  boosted: { id: string; score: number }[],
+  byId: Map<string, MemoryRow>,
+): Promise<{ id: string; score: number }[]> {
+  if (reranker.id === "noop") return boosted;
+  const cands: RerankCandidate[] = boosted.map((b) => ({
+    id: b.id,
+    content: byId.get(b.id)?.content ?? "",
+    score: b.score,
+  }));
+  const out = await reranker.rerank(query, cands);
+  return out.map((c) => ({ id: c.id, score: c.score }));
 }
 
 function asMessage(err: unknown): string {

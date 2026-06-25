@@ -5,6 +5,18 @@ export function toVectorLiteral(vec: number[]): string {
   return `[${vec.join(",")}]`;
 }
 
+/** Parse a pgvector literal (`[0.1,0.2,...]`, as `embedding::text` emits) to numbers. */
+export function parseVectorLiteral(literal: string): number[] {
+  const inner = literal.trim().replace(/^\[/, "").replace(/\]$/, "");
+  if (!inner) return [];
+  const out: number[] = [];
+  for (const part of inner.split(",")) {
+    const n = Number(part);
+    if (Number.isFinite(n)) out.push(n);
+  }
+  return out;
+}
+
 /** Normalise a Postgres timestamptz (Date or string) to an ISO string. */
 export function toIso(v: unknown): string {
   if (v instanceof Date) return v.toISOString();
@@ -30,6 +42,10 @@ export interface MemoryRow {
   source: string | null;
   created_at: Date;
   last_accessed: Date;
+  // --- Temporal evolution (EPIC F). Optional: not every SELECT projects them. ---
+  superseded_by?: string | null;
+  valid_from?: Date;
+  valid_to?: Date | null;
 }
 
 export interface FactRow {

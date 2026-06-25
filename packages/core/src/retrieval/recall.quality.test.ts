@@ -1,7 +1,7 @@
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { NoOpEmbedder } from "../embedder/noop.js";
-import type { Embedder, MemoryContext } from "../types.js";
+import type { Embedder, MemoryContext, Reranker } from "../types.js";
 import { buildContext } from "./context.js";
 import { recall } from "./recall.js";
 import { remember } from "./remember.js";
@@ -66,6 +66,100 @@ describe("recall sets ivfflat.probes", () => {
     const calls: RecordedCall[] = [];
     await recall(recordingPool(calls), ctx, new NoOpEmbedder(), { query: "hello" });
     expect(calls.some((c) => c.sql.includes("ivfflat.probes"))).toBe(false);
+  });
+});
+
+describe("recall MMR candidate-embedding fetch (EPIC H)", () => {
+  const ctx: MemoryContext = { workspaceId: "00000000-0000-0000-0000-0000000000aa", userId: null };
+  const KEY = "DOLORES_MMR_LAMBDA";
+
+  it("selects embedding::text for the candidate pool when MMR is enabled", async () => {
+    const saved = process.env[KEY];
+    process.env[KEY] = "0.5";
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, fixedEmbedder(384), { query: "hi" });
+      expect(calls.some((c) => c.sql.includes("embedding::text"))).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env[KEY];
+      else process.env[KEY] = saved;
+    }
+  });
+
+  it("does NOT fetch embeddings by default (MMR off, λ=1)", async () => {
+    const saved = process.env[KEY];
+    delete process.env[KEY];
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, fixedEmbedder(384), { query: "hi" });
+      expect(calls.some((c) => c.sql.includes("embedding::text"))).toBe(false);
+    } finally {
+      if (saved !== undefined) process.env[KEY] = saved;
+    }
+  });
+
+  it("does not fetch embeddings in noop mode even with MMR on (nothing to diversify)", async () => {
+    const saved = process.env[KEY];
+    process.env[KEY] = "0.5";
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, new NoOpEmbedder(), { query: "hi" });
+      expect(calls.some((c) => c.sql.includes("embedding::text"))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[KEY];
+      else process.env[KEY] = saved;
+    }
+  });
+});
+
+describe("recall vector-index tuning GUC (EPIC I)", () => {
+  const ctx: MemoryContext = { workspaceId: "00000000-0000-0000-0000-0000000000aa", userId: null };
+  const KEY = "DOLORES_VECTOR_INDEX";
+  const EF = "DOLORES_HNSW_EF_SEARCH";
+
+  it("sets hnsw.ef_search (not ivfflat.probes) when DOLORES_VECTOR_INDEX=hnsw", async () => {
+    const saved = process.env[KEY];
+    process.env[KEY] = "hnsw";
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, fixedEmbedder(384), { query: "hi" });
+      expect(calls.some((c) => c.sql.includes("hnsw.ef_search"))).toBe(true);
+      expect(calls.some((c) => c.sql.includes("ivfflat.probes"))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[KEY];
+      else process.env[KEY] = saved;
+    }
+  });
+
+  it("sets ivfflat.probes by default", async () => {
+    const saved = process.env[KEY];
+    delete process.env[KEY];
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, fixedEmbedder(384), { query: "hi" });
+      expect(calls.some((c) => c.sql.includes("ivfflat.probes"))).toBe(true);
+      expect(calls.some((c) => c.sql.includes("hnsw.ef_search"))).toBe(false);
+    } finally {
+      if (saved !== undefined) process.env[KEY] = saved;
+    }
+  });
+
+  it("honours DOLORES_HNSW_EF_SEARCH", async () => {
+    const savedK = process.env[KEY];
+    const savedE = process.env[EF];
+    process.env[KEY] = "hnsw";
+    process.env[EF] = "120";
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, fixedEmbedder(384), { query: "hi" });
+      const efCall = calls.find((c) => c.sql.includes("hnsw.ef_search"));
+      expect(efCall?.params?.[0]).toBe("120");
+    } finally {
+      if (savedK === undefined) delete process.env[KEY];
+      else process.env[KEY] = savedK;
+      if (savedE === undefined) delete process.env[EF];
+      else process.env[EF] = savedE;
+    }
   });
 });
 
@@ -186,5 +280,25 @@ liveDescribe("retrieval quality (live DB)", () => {
     const staticText = await buildContext(pool, ctx, 600);
     expect(staticText.text).toContain("favorite color is teal");
     expect(staticText.text).toContain("lunch meeting was rescheduled");
+  });
+
+  it("an injected reranker reorders the recall output (EPIC H seam)", async () => {
+    const ctx: MemoryContext = { workspaceId: BOOST_WS, userId: null };
+    const noop = new NoOpEmbedder();
+    await remember(pool, ctx, noop, { content: "short alpha note", importance: 5 });
+    await remember(pool, ctx, noop, {
+      content: "a considerably longer alpha note with many more words in it",
+      importance: 5,
+    });
+
+    // A deterministic reranker that orders by content length, DESC. It must drive
+    // the final order, proving the hook runs between fusion and the top-N cut.
+    const byLengthDesc: Reranker = {
+      id: "test:length-desc",
+      rerank: async (_q, cands) => [...cands].sort((a, b) => b.content.length - a.content.length),
+    };
+    const { hits } = await recall(pool, ctx, noop, { query: "alpha" }, byLengthDesc);
+    expect(hits).toHaveLength(2);
+    expect(hits[0]?.content.length ?? 0).toBeGreaterThan(hits[1]?.content.length ?? 0);
   });
 });

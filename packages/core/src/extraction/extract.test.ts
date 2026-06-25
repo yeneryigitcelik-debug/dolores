@@ -74,12 +74,69 @@ describe("extractFromText", () => {
   it("drops invalid items via schema validation", async () => {
     const provider = stubProvider(
       JSON.stringify({
-        facts: [{ category: "stack", key: "db" }], // missing value → invalid payload
+        facts: [{ category: "stack", key: "db" }], // missing value → invalid item
         memories: [],
       }),
     );
     const res = await extractFromText("x", { enabled: true, provider });
-    // Whole payload fails validation → graceful empty.
+    // The only item is invalid → dropped per-item → graceful empty.
     expect(res).toEqual({ facts: [], memories: [] });
+  });
+
+  it("keeps valid items when a sibling item is malformed (per-item resilience)", async () => {
+    const provider = stubProvider(
+      JSON.stringify({
+        facts: [
+          { category: "stack", key: "db", value: "Postgres" }, // valid
+          { category: "stack", key: "broken" }, // missing value → invalid
+        ],
+        memories: [
+          { content: "ships on fridays" }, // valid
+          { importance: 5 }, // missing content → invalid
+        ],
+      }),
+    );
+    const res = await extractFromText("x", { enabled: true, provider });
+    expect(res.facts).toEqual([
+      { category: "stack", key: "db", value: "Postgres", scope: undefined },
+    ]);
+    expect(res.memories).toHaveLength(1);
+    expect(res.memories[0]?.content).toBe("ships on fridays");
+  });
+
+  it("drops items below the confidence floor but keeps confidence-less items", async () => {
+    const provider = stubProvider(
+      JSON.stringify({
+        facts: [
+          { category: "stack", key: "db", value: "Postgres", confidence: 0.95 },
+          { category: "stack", key: "cache", value: "Redis", confidence: 0.2 }, // below floor
+          { category: "preference", key: "editor", value: "vim" }, // no confidence → kept
+        ],
+        memories: [],
+      }),
+    );
+    const res = await extractFromText("x", { enabled: true, provider, minConfidence: 0.5 });
+    const values = res.facts.map((f) => f.value);
+    expect(values).toContain("Postgres");
+    expect(values).toContain("vim");
+    expect(values).not.toContain("Redis");
+  });
+
+  it("renders knownFacts into the system prompt for contradiction alignment", async () => {
+    let capturedSystem = "";
+    const provider: LlmProvider = {
+      id: "rec",
+      complete: async ({ system }) => {
+        capturedSystem = system ?? "";
+        return '{"facts":[],"memories":[]}';
+      },
+    };
+    await extractFromText("we switched db to mysql", {
+      enabled: true,
+      provider,
+      knownFacts: [{ category: "stack", key: "db", value: "Postgres" }],
+    });
+    expect(capturedSystem).toContain("[stack] db: Postgres");
+    expect(capturedSystem).toContain("SAME category+key");
   });
 });

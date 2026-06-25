@@ -12,13 +12,15 @@
   "scripts": {
     "build": "pnpm -r build",
     "dev": "pnpm -r --parallel dev",
-    "test": "pnpm -r test",
+    "test": "pnpm -r --workspace-concurrency=1 test",
     "lint": "biome check .",
     "format": "biome format --write .",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
     "db:logs": "docker compose logs -f db",
-    "bench": "DOLORES_MODEL_CACHE=packages/core/.dolores-models node_modules/.bin/tsx benchmarks/run.ts"
+    "bench": "DOLORES_MODEL_CACHE=packages/core/.dolores-models node_modules/.bin/tsx benchmarks/run.ts",
+    "bench:extraction": "node_modules/.bin/tsx benchmarks/extraction-eval.ts",
+    "loadtest": "node scripts/loadtest.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

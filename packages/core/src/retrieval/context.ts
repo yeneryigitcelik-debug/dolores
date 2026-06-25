@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from "pg";
 import { NoOpEmbedder } from "../embedder/noop.js";
-import type { Embedder, Fact, MemoryContext } from "../types.js";
+import type { Embedder, Fact, MemoryContext, Reranker } from "../types.js";
 import { recall } from "./recall.js";
 import { type FactRow, type MemoryRow, rowToFact } from "./sql.js";
 import { withTenant } from "./tenant.js";
@@ -43,15 +43,19 @@ export async function buildContext(
   maxTokens = 600,
   query?: string,
   embedder?: Embedder,
+  reranker?: Reranker,
 ): Promise<BuiltContext> {
   const trimmedQuery = query?.trim();
 
   if (trimmedQuery) {
     const facts = await withTenant(pool, ctx, fetchFacts);
-    const { hits } = await recall(pool, ctx, embedder ?? new NoOpEmbedder(), {
-      query: trimmedQuery,
-      limit: MEMORY_CANDIDATES,
-    });
+    const { hits } = await recall(
+      pool,
+      ctx,
+      embedder ?? new NoOpEmbedder(),
+      { query: trimmedQuery, limit: MEMORY_CANDIDATES },
+      reranker,
+    );
     const memories: RenderMemory[] = hits.map((h) => ({
       content: h.content,
       importance: h.importance,
@@ -64,6 +68,7 @@ export async function buildContext(
     const memories = await client.query<MemoryRow>(
       `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed
          FROM memories
+        WHERE superseded_by IS NULL
         ORDER BY importance DESC, last_accessed DESC, created_at DESC
         LIMIT $1`,
       [MEMORY_CANDIDATES],

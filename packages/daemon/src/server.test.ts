@@ -1,4 +1,4 @@
-import { type DaemonConfig, NoOpEmbedder, type PruneResponse } from "@dolores/core";
+import { type DaemonConfig, NoOpEmbedder, type PruneResponse, withTenant } from "@dolores/core";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { loadConfig } from "./config.js";
@@ -500,24 +500,30 @@ describe("Error response schema", () => {
 // Suite: /ingest returns 202 Accepted
 // ---------------------------------------------------------------------------
 
-describe("POST /ingest → 202 Accepted", () => {
+describe.skipIf(!HAS_DB)("POST /ingest → 202 + jobId, /ingest/status", () => {
   let pool: Pool;
   let app: Awaited<ReturnType<typeof createApp>>;
 
   beforeAll(async () => {
-    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    pool = new Pool({ connectionString: DB_URL });
     const embedder = new NoOpEmbedder();
     await embedder.ready();
+    // createApp does NOT start the ingest worker, so jobs stay 'pending' here —
+    // which is exactly what lets us assert the enqueued state deterministically.
     app = await createApp(pool, embedder, cfg);
     await app.ready();
   });
 
   afterAll(async () => {
+    // Clean up the pending jobs this suite enqueued (no worker drained them).
+    await withTenant(pool, { workspaceId: TEST_WORKSPACE_ID }, (c) =>
+      c.query("DELETE FROM ingest_jobs WHERE workspace_id = $1", [TEST_WORKSPACE_ID]),
+    ).catch(() => undefined);
     await app.close();
     await pool.end().catch(() => undefined);
   });
 
-  it("returns 202 with { queued: true }", async () => {
+  it("enqueues and returns 202 { queued: true, jobId }", async () => {
     const res = await app.inject({
       method: "POST",
       url: "/ingest",
@@ -529,8 +535,81 @@ describe("POST /ingest → 202 Accepted", () => {
       }),
     });
     expect(res.statusCode).toBe(202);
-    const body = JSON.parse(res.body) as { queued: boolean };
+    const body = JSON.parse(res.body) as { queued: boolean; jobId?: string };
     expect(body.queued).toBe(true);
+    expect(body.jobId).toMatch(/^[0-9a-f-]{36}$/);
+
+    // /ingest/status reflects the queued job (pending — no worker in createApp).
+    const statusRes = await app.inject({
+      method: "POST",
+      url: "/ingest/status",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        jobId: body.jobId,
+      }),
+    });
+    expect(statusRes.statusCode).toBe(200);
+    const status = JSON.parse(statusRes.body) as { id: string; status: string; attempts: number };
+    expect(status.id).toBe(body.jobId);
+    expect(status.status).toBe("pending");
+    expect(status.attempts).toBe(0);
+  });
+
+  it("/ingest/status returns 404 for an unknown jobId", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/ingest/status",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        workspaceId: TEST_WORKSPACE_ID,
+        userId: TEST_USER_ID,
+        jobId: "00000000-0000-0000-0000-0000000000ff",
+      }),
+    });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: POST /consolidate gate (off by default — no DB needed)
+// ---------------------------------------------------------------------------
+
+describe("POST /consolidate — gate", () => {
+  let pool: Pool;
+  let app: Awaited<ReturnType<typeof createApp>>;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    // DOLORES_CONSOLIDATION_MODE is unset → disabled → the route returns early.
+    app = await createApp(pool, embedder, cfg);
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end().catch(() => undefined);
+  });
+
+  it("returns enabled:false (no-op) when consolidation is off", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/consolidate",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: TEST_WORKSPACE_ID }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as {
+      enabled: boolean;
+      candidates: number;
+      consolidated: number;
+    };
+    expect(body.enabled).toBe(false);
+    expect(body.candidates).toBe(0);
+    expect(body.consolidated).toBe(0);
   });
 });
 
@@ -592,6 +671,31 @@ describe("GET /metrics — shape", () => {
     expect(typeof healthRoute?.count).toBe("number");
     expect(healthRoute?.count).toBeGreaterThanOrEqual(2);
     expect(typeof healthRoute?.avgMs).toBe("number");
+  });
+
+  it("exposes percentiles + dedupRate (EPIC K)", async () => {
+    await app.inject({ method: "GET", url: "/health" });
+    const res = await app.inject({ method: "GET", url: "/metrics" });
+    const body = JSON.parse(res.body) as {
+      dedupRate: number;
+      routes: Record<string, { p50Ms: number; p95Ms: number; p99Ms: number; errors5xx: number }>;
+    };
+    expect(typeof body.dedupRate).toBe("number");
+    const health = body.routes["GET /health"];
+    expect(typeof health?.p50Ms).toBe("number");
+    expect(typeof health?.p95Ms).toBe("number");
+    expect(typeof health?.p99Ms).toBe("number");
+    expect(typeof health?.errors5xx).toBe("number");
+  });
+
+  it("/metrics/prometheus returns Prometheus exposition text", async () => {
+    await app.inject({ method: "GET", url: "/health" });
+    const res = await app.inject({ method: "GET", url: "/metrics/prometheus" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/plain");
+    expect(res.body).toContain("# TYPE dolores_requests_total counter");
+    expect(res.body).toContain("dolores_route_latency_ms{route=");
+    expect(res.body).toContain('quantile="0.95"');
   });
 });
 

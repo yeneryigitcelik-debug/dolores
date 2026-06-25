@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Memory consolidation** (v0.4 EPIC L). Collapses clusters of related active
+  memories into one higher-order note and *supersedes* the members (EPIC F chain
+  — never deletes), shrinking the corpus and sharpening recall.
+  - Opt-in `DOLORES_CONSOLIDATION_MODE=on`; `POST /consolidate` + `dolores
+    consolidate`. Clusters by cosine ≥ 0.82 (below the 0.9 dedup line → merges
+    *related* notes, not duplicates), synthesises one note per cluster (min 3
+    members) with the cheap extraction LLM — off any DB transaction and off the
+    recall path. No provider → graceful no-op. Members stay queryable via `asOf`.
+- **Observability** (v0.4 EPIC K). Local, no external egress:
+  - Rich **`GET /metrics`** (JSON): per-route p50/p95/p99 latency (rolling 1024-req
+    window), 4xx/5xx counts, all-time totals, `dedupRate`, DB connectivity, and
+    ingest-queue depth by status.
+  - **`GET /metrics/prometheus`**: the same data in Prometheus exposition format.
+  - `pnpm loadtest` — a dependency-free load harness reporting p50/p95/p99,
+    throughput, and error rate against a running daemon.
+  - _(OpenTelemetry/OTLP tracing intentionally deferred — heavy optional deps +
+    external egress, niche for a localhost daemon. Metrics + pino logs cover it.)_
+- **Durable ingest queue** (v0.4 EPIC J). `/ingest` no longer fire-and-forgets:
+  the text is persisted as a job in a Postgres-native queue and a background
+  worker distils it asynchronously, so **work survives daemon restarts**.
+  - `POST /ingest` returns `{ queued, jobId }`; new `POST /ingest/status` polls a
+    job (`pending → running → done | failed`).
+  - Workers claim jobs with `FOR UPDATE SKIP LOCKED` (SECURITY DEFINER, like the
+    decay jobs); per-tenant writes still run under RLS. `DOLORES_INGEST_WORKERS`,
+    `DOLORES_INGEST_POLL_MS`, `DOLORES_INGEST_MAX_ATTEMPTS` (exponential backoff).
+  - **Privacy (rule 1):** `payload` is purged the instant a job is terminal; a
+    nightly `pg_cron` job deletes old terminal rows. dolores never stores raw text.
+  - On startup the worker reclaims jobs stuck in `running` from a crashed run.
+- **HNSW vector index option** (v0.4 EPIC I). `DOLORES_VECTOR_INDEX=hnsw` (pgvector
+  ≥0.5) builds an HNSW index instead of ivfflat — higher recall + lower latency at
+  scale. `applyMigrations()` builds the selected index and drops the other
+  (idempotent, no rebuild on re-run with the same kind). recall sets the matching
+  query-time GUC automatically: `DOLORES_IVFFLAT_PROBES` or `DOLORES_HNSW_EF_SEARCH`.
+  `pnpm bench` labels the active index so ivfflat-vs-hnsw runs are comparable.
+  Closes the last open "ivfflat vs hnsw" question. Default stays ivfflat.
+- **Retrieval ranking v2** (v0.3 EPIC H, partial). Recall stays LLM-free (pure
+  SQL + vector + math):
+  - **Tunable weighted fusion** — `DOLORES_FUSION_VECTOR_WEIGHT` /
+    `DOLORES_FUSION_FT_WEIGHT` bias the RRF score toward semantic or keyword
+    match (default 1=1 = classic equal-weight RRF). Closes the open "hybrid score
+    weighting" question.
+  - **MMR diversity** — `DOLORES_MMR_LAMBDA` (<1) trades relevance for diversity
+    so the top-N isn't near-duplicate memories; candidate embeddings are fetched
+    only when MMR is on. Pure cosine math, no model. Default 1 = off (unchanged).
+  - **Pluggable reranker seam** — a `Reranker` interface + `NoOpReranker` (default,
+    identity) wired as an optional final stage in `recall`/`buildContext`,
+    selected via `DOLORES_RERANKER`. The documented extension point for a LOCAL
+    cross-encoder (never an LLM); the concrete model is deferred (fastembed ships
+    no reranker, so it needs its own dependency + eval).
+- **Extraction quality v2** (v0.3 EPIC G). The async distiller is more robust and
+  measurable, still off the critical path:
+  - **Per-item validation** — one malformed fact/memory no longer drops the whole
+    payload; valid items survive.
+  - **Confidence gating** — items may carry a `confidence` (0..1); set
+    `DOLORES_EXTRACTION_MIN_CONFIDENCE` to drop low-confidence ones (default 0 =
+    keep all; confidence-less items always kept).
+  - **Contradiction-aware** — `ingestText` feeds the tenant's existing facts into
+    the prompt so the model reuses the SAME category+key on an update (→ upsert
+    overwrites instead of creating a near-duplicate). Stronger few-shot prompt.
+  - **Extraction eval harness** — `pnpm bench:extraction` scores fact/memory
+    recall + ephemeral-discipline on labelled fixtures (skips without an API key).
+- **Temporal memory evolution** (v0.3 EPIC F). A near-duplicate write can now
+  *supersede* the old memory instead of silently overwriting it:
+  - `DOLORES_EVOLUTION_MODE=versioned` keeps history — the old row is chained
+    (`superseded_by`) and its validity window is closed (`valid_to`), while a fresh
+    active row carries the current value. Default stays `inplace` (overwrite).
+  - `/recall` gains `asOf` (ISO date/datetime → point-in-time recall) and
+    `includeSuperseded` (surface historical rows). Default recall and the static
+    `/context` blob show the **active** set only.
+  - New raw-SQL columns on `memories` (`superseded_by`, `valid_from`, `valid_to`)
+    + a partial active-set index, applied idempotently by `applyMigrations()`.
+  - Dedup now compares against active rows only; recency (`last_accessed`) is not
+    bumped on `asOf`/`includeSuperseded` reads (no pollution of the live signal).
+
 ## [0.2.0] - 2026-06-20
 
 ### Added

@@ -1,5 +1,11 @@
 import type { Pool } from "pg";
-import type { Embedder, MemoryContext, RememberInput, RememberResponse } from "../types.js";
+import type {
+  Embedder,
+  EvolutionMode,
+  MemoryContext,
+  RememberInput,
+  RememberResponse,
+} from "../types.js";
 import { clampImportance, requireRow, toVectorLiteral } from "./sql.js";
 import { withTenant } from "./tenant.js";
 
@@ -8,7 +14,17 @@ export const SUPERSEDE_THRESHOLD = 0.9;
 
 interface SimilarRow {
   id: string;
+  importance: number;
   similarity: number;
+}
+
+/**
+ * Resolve the memory evolution mode from the environment. Mirrors the local
+ * env-read pattern used for DOLORES_IVFFLAT_PROBES in recall.ts — a write/storage
+ * tuning knob read at the point of use. Defaults to the safe `inplace` behaviour.
+ */
+function resolveEvolutionMode(): EvolutionMode {
+  return process.env.DOLORES_EVOLUTION_MODE === "versioned" ? "versioned" : "inplace";
 }
 
 /**
@@ -96,10 +112,13 @@ async function writeMemory(
       const literal = toVectorLiteral(vector);
       // Explicit workspace_id filter in addition to RLS: defence-in-depth, and it
       // keeps dedup deterministic even if a connection's tenant GUC were ever wrong.
+      // Only ACTIVE rows (superseded_by IS NULL) are dedup candidates — we never
+      // supersede an already-superseded (historical) memory.
       const similar = await client.query<SimilarRow>(
-        `SELECT id, 1 - (embedding <=> $1::vector) AS similarity
+        `SELECT id, importance, 1 - (embedding <=> $1::vector) AS similarity
            FROM memories
           WHERE embedding IS NOT NULL AND scope = $2 AND workspace_id = $3
+            AND superseded_by IS NULL
           ORDER BY embedding <=> $1::vector
           LIMIT 1`,
         [literal, scope, ctx.workspaceId],
@@ -107,6 +126,26 @@ async function writeMemory(
 
       const top = similar.rows[0];
       if (top && top.similarity > SUPERSEDE_THRESHOLD) {
+        if (resolveEvolutionMode() === "versioned") {
+          // Versioned: keep history. Insert the fresher statement as a new active
+          // row, then close the old row's validity window and chain it forward.
+          // Importance carries over (GREATEST) so superseding never drops signal.
+          const kept = Math.max(importance, top.importance);
+          const inserted = await client.query<{ id: string }>(
+            `INSERT INTO memories (workspace_id, user_id, scope, content, importance, source, embedding)
+             VALUES ($1, $2, $3, $4, $5, $6, $7::vector)
+             RETURNING id`,
+            [ctx.workspaceId, ctx.userId ?? null, scope, content, kept, source, literal],
+          );
+          const newId = requireRow(inserted.rows, "remember versioned insert").id;
+          await client.query(
+            "UPDATE memories SET superseded_by = $1, valid_to = now() WHERE id = $2",
+            [newId, top.id],
+          );
+          return { id: newId, deduped: true };
+        }
+
+        // inplace (default): overwrite the existing row, keep the stronger importance.
         const updated = await client.query<{ id: string }>(
           `UPDATE memories
               SET content = $1,
