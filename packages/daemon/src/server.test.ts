@@ -573,6 +573,47 @@ describe.skipIf(!HAS_DB)("POST /ingest → 202 + jobId, /ingest/status", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Suite: POST /consolidate gate (off by default — no DB needed)
+// ---------------------------------------------------------------------------
+
+describe("POST /consolidate — gate", () => {
+  let pool: Pool;
+  let app: Awaited<ReturnType<typeof createApp>>;
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    const embedder = new NoOpEmbedder();
+    await embedder.ready();
+    // DOLORES_CONSOLIDATION_MODE is unset → disabled → the route returns early.
+    app = await createApp(pool, embedder, cfg);
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await pool.end().catch(() => undefined);
+  });
+
+  it("returns enabled:false (no-op) when consolidation is off", async () => {
+    const res = await app.inject({
+      method: "POST",
+      url: "/consolidate",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workspaceId: TEST_WORKSPACE_ID }),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body) as {
+      enabled: boolean;
+      candidates: number;
+      consolidated: number;
+    };
+    expect(body.enabled).toBe(false);
+    expect(body.candidates).toBe(0);
+    expect(body.consolidated).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Suite: GET /metrics
 // ---------------------------------------------------------------------------
 

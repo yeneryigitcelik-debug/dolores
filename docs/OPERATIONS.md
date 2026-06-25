@@ -90,6 +90,22 @@ Default recall and the static `/context` blob always show the **active** set onl
 
 ---
 
+## Memory Consolidation (EPIC L)
+
+Over time, many related-but-distinct memories accumulate. Consolidation collapses a **cluster** of related active memories into one higher-order note and *supersedes* the members (EPIC F chain — **never deletes**), shrinking the corpus and sharpening recall.
+
+Opt-in via `DOLORES_CONSOLIDATION_MODE=on`. Trigger it manually or from your own cron (a `pg_cron` job can't call an LLM):
+
+```bash
+dolores consolidate                 # current workspace, all scopes
+dolores consolidate --scope workspace
+# or directly: curl -s localhost:4505/consolidate -d '{"workspaceId":"…"}'
+```
+
+How it works: it pulls active, embedded memories, clusters them by cosine similarity (default ≥ 0.82 — below the 0.9 dedup line, so it merges *related* notes, not near-duplicates), asks the cheap extraction LLM to synthesise one note per cluster (min 3 members), writes it, and points the members' `superseded_by` at it. The LLM call runs **off** any DB transaction and **off** the recall path. No provider / API key → graceful no-op. Superseded members remain queryable via `asOf` / `includeSuperseded`.
+
+---
+
 ## Observability (EPIC K)
 
 The daemon exposes in-memory request metrics — no external egress (KVKK-clean):

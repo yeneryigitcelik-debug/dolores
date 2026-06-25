@@ -1,4 +1,5 @@
 import {
+  type ConsolidateResponse,
   type ContextResponse,
   type DecayMode,
   type Embedder,
@@ -13,6 +14,7 @@ import {
   type RememberResponse,
   type StatusResponse,
   buildContext,
+  consolidateMemories,
   createEmbedder,
   createReranker,
   enqueueIngestJob,
@@ -89,6 +91,10 @@ const ingestStatusBodySchema = ctxSchema.extend({
 
 const pruneBodySchema = ctxSchema.extend({
   dryRun: z.boolean().optional(),
+});
+
+const consolidateBodySchema = ctxSchema.extend({
+  scope: scopeSchema.optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -571,6 +577,37 @@ export async function createApp(
       return { deleted, softened, dryRun };
     } catch (err) {
       request.log.error({ err }, "/prune error");
+      return reply.status(500).send({
+        error: { code: "INTERNAL", message: "An internal error occurred" },
+      });
+    }
+  });
+
+  // ---------- POST /consolidate ----------
+  // Opt-in (DOLORES_CONSOLIDATION_MODE=on). Collapses clusters of related memories
+  // into one note, superseding members (never deletes). Off the critical path.
+  const consolidationEnabled =
+    (process.env.DOLORES_CONSOLIDATION_MODE ?? "off").trim().toLowerCase() === "on";
+  app.post("/consolidate", async (request, reply): Promise<ConsolidateResponse | undefined> => {
+    const parsed = consolidateBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "Request validation failed",
+          issues: parsed.error.issues,
+        },
+      });
+    }
+    const { workspaceId, userId, scope } = parsed.data;
+    const empty = { candidates: 0, clusters: 0, consolidated: 0, superseded: 0 };
+    if (!consolidationEnabled) return { enabled: false, ...empty };
+    const ctx: MemoryContext = { workspaceId, userId };
+    try {
+      const summary = await consolidateMemories(pool, ctx, embedder, { scope });
+      return { enabled: true, ...summary };
+    } catch (err) {
+      request.log.error({ err }, "/consolidate error");
       return reply.status(500).send({
         error: { code: "INTERNAL", message: "An internal error occurred" },
       });

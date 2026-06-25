@@ -13,6 +13,7 @@
  *   DOLORES_DAEMON_PORT   — default 4505
  */
 import { Command } from "commander";
+import { runConsolidate } from "./commands/consolidate.js";
 import { runContext } from "./commands/context.js";
 import { runFacts } from "./commands/facts.js";
 import { runIngest } from "./commands/ingest.js";
@@ -126,6 +127,20 @@ program
   .option("--confirm", "önizlemeyi atla ve gerçekten sil (geri alınamaz)")
   .action(async (opts: { dryRun?: boolean; confirm?: boolean }) => {
     await runPrune(opts);
+  });
+
+// ---------------------------------------------------------------------------
+// consolidate — POST /consolidate  (opt-in: DOLORES_CONSOLIDATION_MODE=on)
+// ---------------------------------------------------------------------------
+program
+  .command("consolidate")
+  .description(
+    "İlişkili bellek kümelerini tek üst-seviye nota indir (üyeler supersede edilir, silinmez).\n" +
+      "  Opt-in: daemon'da DOLORES_CONSOLIDATION_MODE=on gerekir.",
+  )
+  .option("--scope <scope>", "personal veya workspace filtresi (ikisi için atla)")
+  .action(async (opts: { scope?: string }) => {
+    await runConsolidate(opts);
   });
 
 // ---------------------------------------------------------------------------

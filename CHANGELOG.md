@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Memory consolidation** (v0.4 EPIC L). Collapses clusters of related active
+  memories into one higher-order note and *supersedes* the members (EPIC F chain
+  — never deletes), shrinking the corpus and sharpening recall.
+  - Opt-in `DOLORES_CONSOLIDATION_MODE=on`; `POST /consolidate` + `dolores
+    consolidate`. Clusters by cosine ≥ 0.82 (below the 0.9 dedup line → merges
+    *related* notes, not duplicates), synthesises one note per cluster (min 3
+    members) with the cheap extraction LLM — off any DB transaction and off the
+    recall path. No provider → graceful no-op. Members stay queryable via `asOf`.
 - **Observability** (v0.4 EPIC K). Local, no external egress:
   - Rich **`GET /metrics`** (JSON): per-route p50/p95/p99 latency (rolling 1024-req
     window), 4xx/5xx counts, all-time totals, `dedupRate`, DB connectivity, and

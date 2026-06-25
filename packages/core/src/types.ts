@@ -207,6 +207,7 @@ export const DAEMON_ROUTES = {
   ingest: { method: "POST", path: "/ingest" },
   ingestStatus: { method: "POST", path: "/ingest/status" },
   prune: { method: "POST", path: "/prune" },
+  consolidate: { method: "POST", path: "/consolidate" },
 } as const;
 
 export interface RememberRequest extends MemoryContext, RememberInput {}
@@ -280,6 +281,23 @@ export interface PruneResponse {
   deleted: number;
   softened: number;
   dryRun: boolean;
+}
+
+/** Result of a consolidation run (EPIC L). */
+export interface ConsolidationSummary {
+  candidates: number;
+  clusters: number;
+  /** clusters that produced a consolidated memory. */
+  consolidated: number;
+  /** member memories superseded into a consolidation. */
+  superseded: number;
+}
+export interface ConsolidateRequest extends MemoryContext {
+  scope?: Scope;
+}
+export interface ConsolidateResponse extends ConsolidationSummary {
+  /** false when DOLORES_CONSOLIDATION_MODE is off (the run is a no-op). */
+  enabled: boolean;
 }
 
 export interface HealthResponse {
