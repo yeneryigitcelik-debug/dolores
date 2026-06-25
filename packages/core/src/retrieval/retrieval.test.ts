@@ -60,6 +60,26 @@ describe("fuseRrf", () => {
   it("respects limit", () => {
     expect(fuseRrf([["a", "b", "c", "d"]], { limit: 2 })).toHaveLength(2);
   });
+
+  it("default weights are identical to classic equal-weight RRF", () => {
+    const arms: [string[], string[]] = [
+      ["x", "y"],
+      ["x", "z"],
+    ];
+    expect(fuseRrf(arms, { weights: [1, 1] })).toEqual(fuseRrf(arms));
+  });
+
+  it("per-arm weights let one arm dominate while scores stay 0..1", () => {
+    // 'v' tops only the vector arm, 'f' only full-text. A heavy vector weight
+    // must rank 'v' above 'f'.
+    const fused = fuseRrf([["v"], ["f"]], { weights: [5, 1] });
+    const ids = fused.map((h) => h.id);
+    expect(ids.indexOf("v")).toBeLessThan(ids.indexOf("f"));
+    for (const h of fused) {
+      expect(h.score).toBeGreaterThan(0);
+      expect(h.score).toBeLessThanOrEqual(1);
+    }
+  });
 });
 
 describe("applyBoost", () => {

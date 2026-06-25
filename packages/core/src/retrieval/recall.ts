@@ -7,8 +7,9 @@ import type {
   RecallResult,
   Scope,
 } from "../types.js";
+import { mmrSelect } from "./mmr.js";
 import { type BoostableHit, applyBoost, fuseRrf } from "./rrf.js";
-import { type MemoryRow, toIso, toVectorLiteral } from "./sql.js";
+import { type MemoryRow, parseVectorLiteral, toIso, toVectorLiteral } from "./sql.js";
 import { withTenant } from "./tenant.js";
 import { tokenEstimate } from "./tokens.js";
 
@@ -33,6 +34,33 @@ function resolveIvfflatProbes(): number {
 }
 
 /**
+ * MMR diversity λ (EPIC H). 1 (default) = OFF (pure relevance, current behaviour).
+ * <1 trades relevance for diversity so the top-N isn't near-duplicates.
+ */
+function resolveMmrLambda(): number {
+  const raw = Number(process.env.DOLORES_MMR_LAMBDA);
+  if (!Number.isFinite(raw) || raw >= 1) return 1;
+  return Math.max(0, raw);
+}
+
+interface FusionWeights {
+  vector: number;
+  fullText: number;
+}
+
+/** Per-arm RRF weights (EPIC H). Default 1 each = classic equal-weight RRF. */
+function resolveFusionWeights(): FusionWeights {
+  const w = (name: string): number => {
+    const raw = Number(process.env[name]);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 1;
+  };
+  return {
+    vector: w("DOLORES_FUSION_VECTOR_WEIGHT"),
+    fullText: w("DOLORES_FUSION_FT_WEIGHT"),
+  };
+}
+
+/**
  * Hybrid recall: pgvector cosine + Postgres full-text, fused with RRF.
  *
  * SAF SQL + vector — no LLM on this path. With the noop embedder (dim 0) only
@@ -52,6 +80,9 @@ export async function recall(
   // Pull a wider candidate pool per arm so RRF has room to fuse.
   const candidates = Math.min(Math.max(limit * 4, 20), 100);
 
+  const lambda = resolveMmrLambda();
+  const weights = resolveFusionWeights();
+
   let vector: number[] | null = null;
   if (embedder.dim > 0) {
     try {
@@ -62,8 +93,13 @@ export async function recall(
     }
   }
 
+  // MMR needs candidate vectors AND an embedding space to compare in; with the
+  // noop/full-text-only path there is nothing to diversify against, so skip it.
+  const useMmr = lambda < 1 && vector !== null;
+
   return withTenant(pool, ctx, async (client) => {
     const byId = new Map<string, MemoryRow>();
+    const embById = useMmr ? new Map<string, number[]>() : null;
 
     let vectorArm: string[] = [];
     if (vector) {
@@ -72,13 +108,23 @@ export async function recall(
       await client.query("SELECT set_config('ivfflat.probes', $1, true)", [
         String(resolveIvfflatProbes()),
       ]);
-      vectorArm = await runVectorArm(client, ctx.workspaceId, vector, q, candidates, byId);
+      vectorArm = await runVectorArm(client, ctx.workspaceId, vector, q, candidates, byId, embById);
     }
-    const fullTextArm = await runFullTextArm(client, ctx.workspaceId, query, q, candidates, byId);
+    const fullTextArm = await runFullTextArm(
+      client,
+      ctx.workspaceId,
+      query,
+      q,
+      candidates,
+      byId,
+      embById,
+    );
 
     // Fuse ALL candidates (no limit yet) so the importance/recency boost can
     // participate in the final top-N selection, not just reorder a pre-cut slice.
-    const fused = fuseRrf([vectorArm, fullTextArm], {});
+    const fused = fuseRrf([vectorArm, fullTextArm], {
+      weights: [weights.vector, weights.fullText],
+    });
     if (fused.length === 0) return { hits: [], tokenEstimate: 0 };
 
     const now = Date.now();
@@ -91,7 +137,17 @@ export async function recall(
         ageMs: row ? now - new Date(row.last_accessed).getTime() : 0,
       };
     });
-    const ranked = applyBoost(boostable).slice(0, limit);
+    const boosted = applyBoost(boostable);
+
+    // MMR diversity (EPIC H) when enabled; otherwise a pure-relevance slice
+    // (identical to the pre-MMR behaviour).
+    const ranked: { id: string; score: number }[] = embById
+      ? mmrSelect(
+          boosted.map((b) => ({ id: b.id, score: b.score, embedding: embById.get(b.id) ?? null })),
+          lambda,
+          limit,
+        )
+      : boosted.slice(0, limit);
 
     // Recency bump for the rows we actually surface — but ONLY on the default
     // active recall. A point-in-time (asOf) or includeSuperseded query is
@@ -156,6 +212,22 @@ function buildFilters(workspaceId: string, q: RecallQuery, params: unknown[]): s
   return sql;
 }
 
+/** Column list, plus `embedding::text` when MMR needs candidate vectors. */
+type ArmRow = MemoryRow & { emb?: string | null };
+function armCols(embById: Map<string, number[]> | null): string {
+  return embById ? `${MEMORY_COLS}, embedding::text AS emb` : MEMORY_COLS;
+}
+function collect(
+  rows: ArmRow[],
+  byId: Map<string, MemoryRow>,
+  embById: Map<string, number[]> | null,
+) {
+  for (const row of rows) {
+    byId.set(row.id, row);
+    if (embById && row.emb) embById.set(row.id, parseVectorLiteral(row.emb));
+  }
+}
+
 async function runVectorArm(
   client: PoolClient,
   workspaceId: string,
@@ -163,19 +235,20 @@ async function runVectorArm(
   q: RecallQuery,
   candidates: number,
   byId: Map<string, MemoryRow>,
+  embById: Map<string, number[]> | null,
 ): Promise<string[]> {
   const params: unknown[] = [toVectorLiteral(vector)];
   const filters = buildFilters(workspaceId, q, params);
   params.push(candidates);
-  const res = await client.query<MemoryRow>(
-    `SELECT ${MEMORY_COLS}
+  const res = await client.query<ArmRow>(
+    `SELECT ${armCols(embById)}
        FROM memories
       WHERE embedding IS NOT NULL${filters}
       ORDER BY embedding <=> $1::vector
       LIMIT $${params.length}`,
     params,
   );
-  for (const row of res.rows) byId.set(row.id, row);
+  collect(res.rows, byId, embById);
   return res.rows.map((r) => r.id);
 }
 
@@ -186,19 +259,20 @@ async function runFullTextArm(
   q: RecallQuery,
   candidates: number,
   byId: Map<string, MemoryRow>,
+  embById: Map<string, number[]> | null,
 ): Promise<string[]> {
   const params: unknown[] = [FT_CONFIG, query];
   const filters = buildFilters(workspaceId, q, params);
   params.push(candidates);
-  const res = await client.query<MemoryRow>(
-    `SELECT ${MEMORY_COLS}
+  const res = await client.query<ArmRow>(
+    `SELECT ${armCols(embById)}
        FROM memories
       WHERE content_tsv @@ plainto_tsquery($1, $2)${filters}
       ORDER BY ts_rank(content_tsv, plainto_tsquery($1, $2)) DESC
       LIMIT $${params.length}`,
     params,
   );
-  for (const row of res.rows) byId.set(row.id, row);
+  collect(res.rows, byId, embById);
   return res.rows.map((r) => r.id);
 }
 

@@ -22,20 +22,37 @@ export interface FuseOptions {
   k?: number;
   /** Truncate to the top-N after fusion. */
   limit?: number;
+  /**
+   * Per-arm weights, aligned with `arms` by index (default 1 each = classic RRF).
+   * A heavier arm contributes more to a doc's fused score. Normalisation stays
+   * weight-aware so the result is still 0..1. Missing/invalid entries default 1.
+   */
+  weights?: number[];
 }
 
 export function fuseRrf(arms: string[][], opts: FuseOptions = {}): FusedHit[] {
   const k = opts.k ?? 60;
-  const activeArms = arms.filter((arm) => arm.length > 0).length || 1;
-  const maxPerDoc = activeArms * (1 / (k + 1));
+  const weightFor = (i: number): number => {
+    const w = opts.weights?.[i];
+    return typeof w === "number" && Number.isFinite(w) && w >= 0 ? w : 1;
+  };
+
+  // Normalise against the best possible doc: rank #1 in every ACTIVE arm,
+  // weighted. A doc topping a heavily-weighted arm scores proportionally higher.
+  let maxPerDoc = 0;
+  arms.forEach((arm, i) => {
+    if (arm.length > 0) maxPerDoc += weightFor(i) * (1 / (k + 1));
+  });
+  if (maxPerDoc === 0) maxPerDoc = 1 / (k + 1);
 
   const acc = new Map<string, number>();
-  for (const arm of arms) {
-    arm.forEach((id, i) => {
-      const rank = i + 1;
-      acc.set(id, (acc.get(id) ?? 0) + 1 / (k + rank));
+  arms.forEach((arm, i) => {
+    const w = weightFor(i);
+    arm.forEach((id, idx) => {
+      const rank = idx + 1;
+      acc.set(id, (acc.get(id) ?? 0) + w * (1 / (k + rank)));
     });
-  }
+  });
 
   const fused: FusedHit[] = [];
   for (const [id, raw] of acc) {

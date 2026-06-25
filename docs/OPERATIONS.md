@@ -102,6 +102,9 @@ Default recall and the static `/context` blob always show the **active** set onl
 | `DOLORES_EMBED_MODEL` | `bge-small-en-v1.5` | fastembed model name (`bge-small-en-v1.5` = 384d CPU) |
 | `DOLORES_MODEL_CACHE` | `~/.dolores-models` | Where fastembed stores downloaded model weights |
 | `DOLORES_IVFFLAT_PROBES` | `10` | `ivfflat.probes` for pgvector ANN searches (higher = more accurate, slower) |
+| `DOLORES_FUSION_VECTOR_WEIGHT` | `1` | RRF weight for the pgvector arm (bias the hybrid score toward semantic match) |
+| `DOLORES_FUSION_FT_WEIGHT` | `1` | RRF weight for the full-text arm (bias toward keyword match) |
+| `DOLORES_MMR_LAMBDA` | `1` | MMR diversity: `1` = pure relevance (off); `<1` trades relevance for diversity to avoid near-duplicate hits (pure math, no model) |
 | `DOLORES_DECAY_MODE` | `conservative` | `conservative` (soften) or `aggressive` (delete) — see Decay Modes above |
 | `DOLORES_EVOLUTION_MODE` | `inplace` | `inplace` (overwrite) or `versioned` (keep history for `asOf` recall) — see Memory Evolution above |
 | `DOLORES_EXTRACTION_MODEL` | — | LLM model ID used for async fact extraction (`ingest` command) |

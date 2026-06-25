@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Retrieval ranking v2** (v0.3 EPIC H, partial). Recall stays LLM-free (pure
+  SQL + vector + math):
+  - **Tunable weighted fusion** — `DOLORES_FUSION_VECTOR_WEIGHT` /
+    `DOLORES_FUSION_FT_WEIGHT` bias the RRF score toward semantic or keyword
+    match (default 1=1 = classic equal-weight RRF). Closes the open "hybrid score
+    weighting" question.
+  - **MMR diversity** — `DOLORES_MMR_LAMBDA` (<1) trades relevance for diversity
+    so the top-N isn't near-duplicate memories; candidate embeddings are fetched
+    only when MMR is on. Pure cosine math, no model. Default 1 = off (unchanged).
+  - _(Pending: optional local cross-encoder reranker — fastembed has no reranker,
+    so it needs a dependency decision.)_
 - **Extraction quality v2** (v0.3 EPIC G). The async distiller is more robust and
   measurable, still off the critical path:
   - **Per-item validation** — one malformed fact/memory no longer drops the whole

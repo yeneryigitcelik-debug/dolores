@@ -69,6 +69,49 @@ describe("recall sets ivfflat.probes", () => {
   });
 });
 
+describe("recall MMR candidate-embedding fetch (EPIC H)", () => {
+  const ctx: MemoryContext = { workspaceId: "00000000-0000-0000-0000-0000000000aa", userId: null };
+  const KEY = "DOLORES_MMR_LAMBDA";
+
+  it("selects embedding::text for the candidate pool when MMR is enabled", async () => {
+    const saved = process.env[KEY];
+    process.env[KEY] = "0.5";
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, fixedEmbedder(384), { query: "hi" });
+      expect(calls.some((c) => c.sql.includes("embedding::text"))).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env[KEY];
+      else process.env[KEY] = saved;
+    }
+  });
+
+  it("does NOT fetch embeddings by default (MMR off, λ=1)", async () => {
+    const saved = process.env[KEY];
+    delete process.env[KEY];
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, fixedEmbedder(384), { query: "hi" });
+      expect(calls.some((c) => c.sql.includes("embedding::text"))).toBe(false);
+    } finally {
+      if (saved !== undefined) process.env[KEY] = saved;
+    }
+  });
+
+  it("does not fetch embeddings in noop mode even with MMR on (nothing to diversify)", async () => {
+    const saved = process.env[KEY];
+    process.env[KEY] = "0.5";
+    try {
+      const calls: RecordedCall[] = [];
+      await recall(recordingPool(calls), ctx, new NoOpEmbedder(), { query: "hi" });
+      expect(calls.some((c) => c.sql.includes("embedding::text"))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env[KEY];
+      else process.env[KEY] = saved;
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Live DB integration. Requires DOLORES_APP_DATABASE_URL + DATABASE_URL on 5544.
 // Uses isolated workspaces + admin (superuser) cleanup, like the concurrency test.
