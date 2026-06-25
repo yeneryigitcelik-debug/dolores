@@ -13,6 +13,7 @@ import {
   type StatusResponse,
   buildContext,
   createEmbedder,
+  createReranker,
   ingestText,
   listFacts,
   recall,
@@ -169,6 +170,10 @@ export async function createApp(
   const logLevel = process.env.DOLORES_LOG_LEVEL ?? "info";
   const app = Fastify({ logger: { level: logLevel } });
 
+  // Optional final-stage reranker (EPIC H). Created once; NoOp unless
+  // DOLORES_RERANKER selects a concrete local reranker. Stays off the LLM path.
+  const reranker = createReranker(process.env.DOLORES_RERANKER);
+
   // ---------- Metrics state ----------
   const metricsStartedAt = Date.now();
   let metricsTotal = 0;
@@ -312,14 +317,13 @@ export async function createApp(
       parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
-      return await recall(pool, ctx, embedder, {
-        query,
-        limit,
-        scope,
-        minImportance,
-        asOf,
-        includeSuperseded,
-      });
+      return await recall(
+        pool,
+        ctx,
+        embedder,
+        { query, limit, scope, minImportance, asOf, includeSuperseded },
+        reranker,
+      );
     } catch (err) {
       request.log.error({ err }, "/recall error");
       return reply.status(500).send({
@@ -345,7 +349,7 @@ export async function createApp(
     try {
       // query present → relevant-memory context (hybrid recall, uses the embedder);
       // absent → static importance/recency blob.
-      const result = await buildContext(pool, ctx, maxTokens, query, embedder);
+      const result = await buildContext(pool, ctx, maxTokens, query, embedder, reranker);
       return { text: result.text, tokenEstimate: result.tokenEstimate };
     } catch (err) {
       request.log.error({ err }, "/context error");

@@ -17,8 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **MMR diversity** — `DOLORES_MMR_LAMBDA` (<1) trades relevance for diversity
     so the top-N isn't near-duplicate memories; candidate embeddings are fetched
     only when MMR is on. Pure cosine math, no model. Default 1 = off (unchanged).
-  - _(Pending: optional local cross-encoder reranker — fastembed has no reranker,
-    so it needs a dependency decision.)_
+  - **Pluggable reranker seam** — a `Reranker` interface + `NoOpReranker` (default,
+    identity) wired as an optional final stage in `recall`/`buildContext`,
+    selected via `DOLORES_RERANKER`. The documented extension point for a LOCAL
+    cross-encoder (never an LLM); the concrete model is deferred (fastembed ships
+    no reranker, so it needs its own dependency + eval).
 - **Extraction quality v2** (v0.3 EPIC G). The async distiller is more robust and
   measurable, still off the critical path:
   - **Per-item validation** — one malformed fact/memory no longer drops the whole

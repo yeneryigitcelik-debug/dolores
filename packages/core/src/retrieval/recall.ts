@@ -1,10 +1,13 @@
 import type { Pool, PoolClient } from "pg";
+import { NoOpReranker } from "../rerank/noop.js";
 import type {
   Embedder,
   MemoryContext,
   RecallHit,
   RecallQuery,
   RecallResult,
+  RerankCandidate,
+  Reranker,
   Scope,
 } from "../types.js";
 import { mmrSelect } from "./mmr.js";
@@ -72,6 +75,7 @@ export async function recall(
   ctx: MemoryContext,
   embedder: Embedder,
   q: RecallQuery,
+  reranker: Reranker = new NoOpReranker(),
 ): Promise<RecallResult> {
   const query = q.query.trim();
   const limit = q.limit && q.limit > 0 ? q.limit : DEFAULT_LIMIT;
@@ -139,15 +143,23 @@ export async function recall(
     });
     const boosted = applyBoost(boostable);
 
+    // Optional final-stage reranker (EPIC H). NoOp default = identity, so this is
+    // a no-op unless a concrete LOCAL reranker is plugged in — never an LLM here.
+    const reordered = await applyReranker(reranker, query, boosted, byId);
+
     // MMR diversity (EPIC H) when enabled; otherwise a pure-relevance slice
     // (identical to the pre-MMR behaviour).
     const ranked: { id: string; score: number }[] = embById
       ? mmrSelect(
-          boosted.map((b) => ({ id: b.id, score: b.score, embedding: embById.get(b.id) ?? null })),
+          reordered.map((b) => ({
+            id: b.id,
+            score: b.score,
+            embedding: embById.get(b.id) ?? null,
+          })),
           lambda,
           limit,
         )
-      : boosted.slice(0, limit);
+      : reordered.slice(0, limit);
 
     // Recency bump for the rows we actually surface — but ONLY on the default
     // active recall. A point-in-time (asOf) or includeSuperseded query is
@@ -274,6 +286,28 @@ async function runFullTextArm(
   );
   collect(res.rows, byId, embById);
   return res.rows.map((r) => r.id);
+}
+
+/**
+ * Run the reranker over the boosted candidates. NoOp (the default) short-circuits
+ * to the input order with zero overhead. A concrete reranker receives
+ * {id, content, score} and returns a reordered (optionally re-scored) list, which
+ * we map back to the {id, score} shape the downstream MMR/slice expects.
+ */
+async function applyReranker(
+  reranker: Reranker,
+  query: string,
+  boosted: { id: string; score: number }[],
+  byId: Map<string, MemoryRow>,
+): Promise<{ id: string; score: number }[]> {
+  if (reranker.id === "noop") return boosted;
+  const cands: RerankCandidate[] = boosted.map((b) => ({
+    id: b.id,
+    content: byId.get(b.id)?.content ?? "",
+    score: b.score,
+  }));
+  const out = await reranker.rerank(query, cands);
+  return out.map((c) => ({ id: c.id, score: c.score }));
 }
 
 function asMessage(err: unknown): string {

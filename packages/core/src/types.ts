@@ -94,6 +94,39 @@ export interface Embedder {
 export type EmbedderKind = "local" | "openai" | "noop";
 
 // ---------------------------------------------------------------------------
+// Reranker abstraction (optional final-stage re-ranking — EPIC H)
+// ---------------------------------------------------------------------------
+
+/** A candidate handed to a Reranker: id + content + the current hybrid score. */
+export interface RerankCandidate {
+  id: string;
+  content: string;
+  /** Current hybrid (fused + boosted) score, 0..1, before reranking. */
+  score: number;
+}
+
+/**
+ * Optional final-stage reranker. Reorders the candidate pool by query relevance
+ * after hybrid fusion. MUST be LOCAL — a CPU model or pure heuristic, NEVER a
+ * network LLM — so recall stays off the critical LLM path. Default is the
+ * identity NoOpReranker; a concrete local cross-encoder can be plugged in via
+ * createReranker (see `@dolores/core` rerank/).
+ */
+export interface Reranker {
+  /** Stable id, e.g. "noop" | "local:bge-reranker-base". */
+  readonly id: string;
+  /** Return the candidates reordered (and optionally re-scored) for `query`. */
+  rerank(query: string, candidates: RerankCandidate[]): Promise<RerankCandidate[]>;
+  /** Warm up / load the model once. Optional. */
+  ready?(): Promise<void>;
+  /** Release native resources before exit. Optional. */
+  dispose?(): Promise<void>;
+}
+
+/** Only "noop" exists today; the extension point for a local cross-encoder. */
+export type RerankerKind = "noop";
+
+// ---------------------------------------------------------------------------
 // Retrieval / write inputs
 // ---------------------------------------------------------------------------
 

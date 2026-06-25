@@ -105,6 +105,7 @@ Default recall and the static `/context` blob always show the **active** set onl
 | `DOLORES_FUSION_VECTOR_WEIGHT` | `1` | RRF weight for the pgvector arm (bias the hybrid score toward semantic match) |
 | `DOLORES_FUSION_FT_WEIGHT` | `1` | RRF weight for the full-text arm (bias toward keyword match) |
 | `DOLORES_MMR_LAMBDA` | `1` | MMR diversity: `1` = pure relevance (off); `<1` trades relevance for diversity to avoid near-duplicate hits (pure math, no model) |
+| `DOLORES_RERANKER` | `noop` | Final-stage reranker kind. Only `noop` (identity) exists today; the extension point for a local cross-encoder (never an LLM). Unknown values fall back to `noop` |
 | `DOLORES_DECAY_MODE` | `conservative` | `conservative` (soften) or `aggressive` (delete) — see Decay Modes above |
 | `DOLORES_EVOLUTION_MODE` | `inplace` | `inplace` (overwrite) or `versioned` (keep history for `asOf` recall) — see Memory Evolution above |
 | `DOLORES_EXTRACTION_MODEL` | — | LLM model ID used for async fact extraction (`ingest` command) |

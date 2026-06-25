@@ -1,7 +1,7 @@
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { NoOpEmbedder } from "../embedder/noop.js";
-import type { Embedder, MemoryContext } from "../types.js";
+import type { Embedder, MemoryContext, Reranker } from "../types.js";
 import { buildContext } from "./context.js";
 import { recall } from "./recall.js";
 import { remember } from "./remember.js";
@@ -229,5 +229,25 @@ liveDescribe("retrieval quality (live DB)", () => {
     const staticText = await buildContext(pool, ctx, 600);
     expect(staticText.text).toContain("favorite color is teal");
     expect(staticText.text).toContain("lunch meeting was rescheduled");
+  });
+
+  it("an injected reranker reorders the recall output (EPIC H seam)", async () => {
+    const ctx: MemoryContext = { workspaceId: BOOST_WS, userId: null };
+    const noop = new NoOpEmbedder();
+    await remember(pool, ctx, noop, { content: "short alpha note", importance: 5 });
+    await remember(pool, ctx, noop, {
+      content: "a considerably longer alpha note with many more words in it",
+      importance: 5,
+    });
+
+    // A deterministic reranker that orders by content length, DESC. It must drive
+    // the final order, proving the hook runs between fusion and the top-N cut.
+    const byLengthDesc: Reranker = {
+      id: "test:length-desc",
+      rerank: async (_q, cands) => [...cands].sort((a, b) => b.content.length - a.content.length),
+    };
+    const { hits } = await recall(pool, ctx, noop, { query: "alpha" }, byLengthDesc);
+    expect(hits).toHaveLength(2);
+    expect(hits[0]?.content.length ?? 0).toBeGreaterThan(hits[1]?.content.length ?? 0);
   });
 });
