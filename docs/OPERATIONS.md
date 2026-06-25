@@ -68,6 +68,28 @@ Aggressive delete is explicitly opt-in to prevent accidental data loss. Set it o
 
 ---
 
+## Memory Evolution (temporal history)
+
+When a new memory closely matches an existing one (cosine > 0.9), `DOLORES_EVOLUTION_MODE` controls what happens:
+
+| Mode | Behaviour | Trade-off |
+|---|---|---|
+| `inplace` (default) | Overwrites the existing memory in place | No history; least storage |
+| `versioned` | Inserts a fresh **active** row and marks the old one *superseded* (chained via `superseded_by`, validity window closed via `valid_to`) | Keeps full history → point-in-time recall; table grows with every contradiction |
+
+`versioned` enables point-in-time queries — the `/recall` body accepts `asOf` (ISO date or datetime) to return the value that was current at that moment, and `includeSuperseded: true` to surface historical rows:
+
+```bash
+# current value
+curl -s localhost:4505/recall -d '{"workspaceId":"…","query":"hosting provider"}'
+# value as of a past date
+curl -s localhost:4505/recall -d '{"workspaceId":"…","query":"hosting provider","asOf":"2026-05-01"}'
+```
+
+Default recall and the static `/context` blob always show the **active** set only; superseded rows never leak into normal retrieval. The required columns are added automatically by `applyMigrations()` (idempotent) — no manual migration step. If you run `versioned`, monitor table growth and rely on `prune` / decay for cleanup of old superseded rows.
+
+---
+
 ## Daemon Environment Variables
 
 | Variable | Default | Description |
@@ -81,6 +103,7 @@ Aggressive delete is explicitly opt-in to prevent accidental data loss. Set it o
 | `DOLORES_MODEL_CACHE` | `~/.dolores-models` | Where fastembed stores downloaded model weights |
 | `DOLORES_IVFFLAT_PROBES` | `10` | `ivfflat.probes` for pgvector ANN searches (higher = more accurate, slower) |
 | `DOLORES_DECAY_MODE` | `conservative` | `conservative` (soften) or `aggressive` (delete) — see Decay Modes above |
+| `DOLORES_EVOLUTION_MODE` | `inplace` | `inplace` (overwrite) or `versioned` (keep history for `asOf` recall) — see Memory Evolution above |
 | `DOLORES_EXTRACTION_MODEL` | — | LLM model ID used for async fact extraction (`ingest` command) |
 | `DOLORES_EXTRACTION_MAX_FACTS` | `20` | Maximum facts extracted per `ingest` call |
 | `DOLORES_EXTRACTION_TIMEOUT_MS` | `30000` | Timeout for a single extraction LLM call (ms) |

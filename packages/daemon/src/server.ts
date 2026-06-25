@@ -48,6 +48,13 @@ const recallBodySchema = ctxSchema.extend({
   limit: z.number().int().min(1).max(100).optional(),
   scope: scopeSchema.optional(),
   minImportance: z.number().int().min(1).max(10).optional(),
+  // Temporal evolution (EPIC F). asOf accepts a date ('YYYY-MM-DD') or full ISO
+  // timestamp — anything Date.parse understands, cast to timestamptz downstream.
+  asOf: z
+    .string()
+    .refine((s) => !Number.isNaN(Date.parse(s)), "asOf must be an ISO date or datetime")
+    .optional(),
+  includeSuperseded: z.boolean().optional(),
 });
 
 const contextBodySchema = ctxSchema.extend({
@@ -301,10 +308,18 @@ export async function createApp(
         },
       });
     }
-    const { workspaceId, userId, query, limit, scope, minImportance } = parsed.data;
+    const { workspaceId, userId, query, limit, scope, minImportance, asOf, includeSuperseded } =
+      parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
-      return await recall(pool, ctx, embedder, { query, limit, scope, minImportance });
+      return await recall(pool, ctx, embedder, {
+        query,
+        limit,
+        scope,
+        minImportance,
+        asOf,
+        includeSuperseded,
+      });
     } catch (err) {
       request.log.error({ err }, "/recall error");
       return reply.status(500).send({

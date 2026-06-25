@@ -30,6 +30,10 @@ export interface MemoryRow {
   source: string | null;
   created_at: Date;
   last_accessed: Date;
+  // --- Temporal evolution (EPIC F). Optional: not every SELECT projects them. ---
+  superseded_by?: string | null;
+  valid_from?: Date;
+  valid_to?: Date | null;
 }
 
 export interface FactRow {

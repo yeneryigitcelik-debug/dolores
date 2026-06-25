@@ -65,6 +65,28 @@ CREATE INDEX IF NOT EXISTS idx_memories_content_tsv
 CREATE INDEX IF NOT EXISTS idx_memories_ranking
   ON memories (workspace_id, importance DESC, last_accessed DESC, created_at DESC);
 
+-- Temporal memory evolution (EPIC F). Columns are added via ALTER (not the
+-- CREATE TABLE above) so existing databases converge too — CREATE TABLE IF NOT
+-- EXISTS never adds columns to a pre-existing table. All statements idempotent.
+--   superseded_by : self-FK to the memory that replaced this one (NULL = active).
+--                   ON DELETE SET NULL keeps the chain from blocking hard deletes.
+--   valid_from    : when this statement became true (backfilled from created_at).
+--   valid_to      : when it stopped being true (set when superseded; NULL = still true).
+ALTER TABLE memories
+  ADD COLUMN IF NOT EXISTS superseded_by UUID REFERENCES memories(id) ON DELETE SET NULL;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS valid_to   TIMESTAMPTZ;
+-- Backfill existing rows from created_at (NOT migration time), then lock the
+-- column down. SET DEFAULT / SET NOT NULL are idempotent on re-run.
+UPDATE memories SET valid_from = created_at WHERE valid_from IS NULL;
+ALTER TABLE memories ALTER COLUMN valid_from SET DEFAULT now();
+ALTER TABLE memories ALTER COLUMN valid_from SET NOT NULL;
+
+-- Partial index for the hot path: recall/context default to the ACTIVE set only.
+CREATE INDEX IF NOT EXISTS idx_memories_active_ranking
+  ON memories (workspace_id, importance DESC, last_accessed DESC)
+  WHERE superseded_by IS NULL;
+
 -- RLS: memories (FORCE ensures table owner also complies, not just non-owners)
 -- CASE avoids ''::uuid cast error — PostgreSQL does not short-circuit AND in policies.
 -- DROP + CREATE for idempotency (PostgreSQL has no CREATE OR REPLACE POLICY).

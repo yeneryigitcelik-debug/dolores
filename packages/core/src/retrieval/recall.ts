@@ -15,6 +15,9 @@ import { tokenEstimate } from "./tokens.js";
 const DEFAULT_LIMIT = 5;
 /** Postgres `regconfig` used for full-text. Matches the db migration's index. */
 const FT_CONFIG = "english";
+/** Columns both arms project (shared so the two SELECTs can't drift). */
+const MEMORY_COLS =
+  "id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed, superseded_by, valid_from, valid_to";
 /**
  * ivfflat.probes default. The db migration builds the index with lists=100, where
  * the engine default of 1 probe scans a single cell → poor recall at this scale.
@@ -90,10 +93,15 @@ export async function recall(
     });
     const ranked = applyBoost(boostable).slice(0, limit);
 
-    // Recency bump for the rows we actually surface.
-    await client.query("UPDATE memories SET last_accessed = now() WHERE id = ANY($1::uuid[])", [
-      ranked.map((f) => f.id),
-    ]);
+    // Recency bump for the rows we actually surface — but ONLY on the default
+    // active recall. A point-in-time (asOf) or includeSuperseded query is
+    // read-only introspection; bumping last_accessed there would pollute the
+    // live recency signal that decay/ranking rely on.
+    if (!q.asOf && !q.includeSuperseded) {
+      await client.query("UPDATE memories SET last_accessed = now() WHERE id = ANY($1::uuid[])", [
+        ranked.map((f) => f.id),
+      ]);
+    }
 
     const hits: RecallHit[] = [];
     for (const f of ranked) {
@@ -107,6 +115,7 @@ export async function recall(
         score: f.score,
         source: row.source,
         createdAt: toIso(row.created_at),
+        supersededBy: row.superseded_by ?? null,
       });
     }
 
@@ -132,6 +141,18 @@ function buildFilters(workspaceId: string, q: RecallQuery, params: unknown[]): s
     params.push(q.minImportance);
     sql += ` AND importance >= $${params.length}`;
   }
+  // Temporal evolution (EPIC F).
+  if (q.asOf) {
+    // Point-in-time: the version whose validity window contains asOf. This spans
+    // superseded rows on purpose (historical versions carry a closed valid_to).
+    params.push(q.asOf);
+    sql += ` AND valid_from <= $${params.length}::timestamptz`;
+    params.push(q.asOf);
+    sql += ` AND (valid_to IS NULL OR valid_to > $${params.length}::timestamptz)`;
+  } else if (!q.includeSuperseded) {
+    // Default: active set only — hide memories that have been superseded.
+    sql += " AND superseded_by IS NULL";
+  }
   return sql;
 }
 
@@ -147,7 +168,7 @@ async function runVectorArm(
   const filters = buildFilters(workspaceId, q, params);
   params.push(candidates);
   const res = await client.query<MemoryRow>(
-    `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed
+    `SELECT ${MEMORY_COLS}
        FROM memories
       WHERE embedding IS NOT NULL${filters}
       ORDER BY embedding <=> $1::vector
@@ -170,7 +191,7 @@ async function runFullTextArm(
   const filters = buildFilters(workspaceId, q, params);
   params.push(candidates);
   const res = await client.query<MemoryRow>(
-    `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed
+    `SELECT ${MEMORY_COLS}
        FROM memories
       WHERE content_tsv @@ plainto_tsquery($1, $2)${filters}
       ORDER BY ts_rank(content_tsv, plainto_tsquery($1, $2)) DESC

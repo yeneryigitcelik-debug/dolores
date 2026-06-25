@@ -15,6 +15,14 @@ export type Scope = "personal" | "workspace";
 /** Decay policy. conservative = soften only; aggressive = pg_cron deletes. */
 export type DecayMode = "conservative" | "aggressive";
 
+/**
+ * Memory evolution policy on near-duplicate write (EPIC F).
+ *  - inplace   : overwrite the existing row (default; no history, least storage).
+ *  - versioned : insert a fresh active row and mark the old one superseded
+ *                (keeps history → `asOf` point-in-time recall works).
+ */
+export type EvolutionMode = "inplace" | "versioned";
+
 /** Structured-fact category. Free-form, but these are the conventional ones. */
 export type FactCategory = "stack" | "preference" | "project" | "decision";
 
@@ -42,6 +50,13 @@ export interface Memory {
   source: string | null;
   createdAt: string;
   lastAccessed: string;
+  // --- Temporal evolution (EPIC F) ---
+  /** id of the memory that replaced this one; null = active (current). */
+  supersededBy: string | null;
+  /** when this statement became true. */
+  validFrom: string;
+  /** when it stopped being true (set on supersede); null = still true. */
+  validTo: string | null;
 }
 
 /** Identity passed with every request — RLS isolation key. */
@@ -100,6 +115,17 @@ export interface RecallQuery {
   scope?: Scope;
   /** 1..10 floor */
   minImportance?: number;
+  /**
+   * Point-in-time recall (EPIC F): return the version of each memory that was
+   * valid at this ISO timestamp (valid_from <= asOf < valid_to). Implies
+   * searching superseded rows, since historical versions carry a valid_to.
+   */
+  asOf?: string;
+  /**
+   * Include superseded (historical) memories in the result. Ignored when `asOf`
+   * is set (asOf already selects by validity window). Default false = active only.
+   */
+  includeSuperseded?: boolean;
 }
 
 export interface RecallHit {
@@ -111,6 +137,12 @@ export interface RecallHit {
   score: number;
   source: string | null;
   createdAt: string;
+  /**
+   * id of the memory that superseded this one; null = active. Populated so
+   * `asOf` / `includeSuperseded` callers can tell historical hits from current
+   * ones. Omitted/null on the default (active-only) path.
+   */
+  supersededBy?: string | null;
 }
 
 export interface RecallResult {

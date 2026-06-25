@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Temporal memory evolution** (v0.3 EPIC F). A near-duplicate write can now
+  *supersede* the old memory instead of silently overwriting it:
+  - `DOLORES_EVOLUTION_MODE=versioned` keeps history — the old row is chained
+    (`superseded_by`) and its validity window is closed (`valid_to`), while a fresh
+    active row carries the current value. Default stays `inplace` (overwrite).
+  - `/recall` gains `asOf` (ISO date/datetime → point-in-time recall) and
+    `includeSuperseded` (surface historical rows). Default recall and the static
+    `/context` blob show the **active** set only.
+  - New raw-SQL columns on `memories` (`superseded_by`, `valid_from`, `valid_to`)
+    + a partial active-set index, applied idempotently by `applyMigrations()`.
+  - Dedup now compares against active rows only; recency (`last_accessed`) is not
+    bumped on `asOf`/`includeSuperseded` reads (no pollution of the live signal).
+
 ## [0.2.0] - 2026-06-20
 
 ### Added

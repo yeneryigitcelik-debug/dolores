@@ -64,6 +64,7 @@ export async function buildContext(
     const memories = await client.query<MemoryRow>(
       `SELECT id, workspace_id, user_id, scope, content, importance, source, created_at, last_accessed
          FROM memories
+        WHERE superseded_by IS NULL
         ORDER BY importance DESC, last_accessed DESC, created_at DESC
         LIMIT $1`,
       [MEMORY_CANDIDATES],

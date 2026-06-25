@@ -35,6 +35,8 @@ model Fact {
 
 /// Semantic memory: free text retrieved by pgvector similarity (+ full-text hybrid).
 /// `embedding VECTOR(384)` and `content_tsv TSVECTOR` are added via raw SQL migration.
+/// Temporal evolution columns (EPIC F) are likewise raw-SQL only:
+///   `superseded_by UUID` (self-FK, NULL = active), `valid_from`/`valid_to TIMESTAMPTZ`.
 model Memory {
   id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   workspaceId  String   @map("workspace_id") @db.Uuid
