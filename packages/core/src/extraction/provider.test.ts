@@ -8,6 +8,12 @@ import {
 // Mock the OPTIONAL @anthropic-ai/sdk dependency (not installed in this package).
 // The provider imports it lazily via a variable specifier; vitest still intercepts.
 const created: { apiKey?: string } = {};
+const anthropicOpts: { options?: { signal?: AbortSignal } } = {};
+const openaiState: {
+  apiKey?: string;
+  body?: Record<string, unknown>;
+  options?: { signal?: AbortSignal };
+} = {};
 const lastCall: {
   model?: string;
   max_tokens?: number;
@@ -18,13 +24,17 @@ const lastCall: {
 vi.mock("@anthropic-ai/sdk", () => {
   class FakeAnthropic {
     messages = {
-      create: async (args: {
-        model: string;
-        max_tokens: number;
-        system?: string;
-        messages: { role: string; content: string }[];
-      }) => {
+      create: async (
+        args: {
+          model: string;
+          max_tokens: number;
+          system?: string;
+          messages: { role: string; content: string }[];
+        },
+        options?: { signal?: AbortSignal },
+      ) => {
         Object.assign(lastCall, args);
+        anthropicOpts.options = options;
         // Claude returns a content-block array; include a non-text block to prove filtering.
         return {
           content: [
@@ -40,6 +50,25 @@ vi.mock("@anthropic-ai/sdk", () => {
     }
   }
   return { default: FakeAnthropic };
+});
+
+// Mock the OPTIONAL openai dependency (never a real network call).
+vi.mock("openai", () => {
+  class FakeOpenAI {
+    chat = {
+      completions: {
+        create: async (body: Record<string, unknown>, options?: { signal?: AbortSignal }) => {
+          openaiState.body = body;
+          openaiState.options = options;
+          return { choices: [{ message: { content: '{"facts":[],"memories":[]}' } }] };
+        },
+      },
+    };
+    constructor(opts: { apiKey: string }) {
+      openaiState.apiKey = opts.apiKey;
+    }
+  }
+  return { default: FakeOpenAI };
 });
 
 const ENV_KEYS = [
@@ -96,6 +125,18 @@ describe("createAnthropicProvider", () => {
     expect(lastCall.messages).toEqual([{ role: "user", content: "extract this" }]);
     // Non-text content blocks are filtered; text blocks concatenated.
     expect(out).toBe('{"facts":[],"memories":[]}');
+  });
+
+  it("propagates the abort signal as the request-options second argument, not the body", async () => {
+    const provider = createAnthropicProvider({ apiKey: "sk-ant", model: "claude-test" });
+    const ac = new AbortController();
+    await provider?.complete({ prompt: "p", system: "S", signal: ac.signal });
+    expect(anthropicOpts.options?.signal).toBe(ac.signal);
+    expect("signal" in lastCall).toBe(false);
+
+    anthropicOpts.options = undefined;
+    await provider?.complete({ prompt: "p" });
+    expect(anthropicOpts.options?.signal).toBeUndefined();
   });
 });
 
@@ -159,5 +200,20 @@ describe("createOpenAiProvider", () => {
     delete process.env[key];
     expect(createOpenAiProvider()).toBeNull();
     if (saved !== undefined) process.env[key] = saved;
+  });
+
+  it("propagates the abort signal as the request-options second argument, not the body", async () => {
+    const provider = createOpenAiProvider({ apiKey: "sk-oai", model: "gpt-test" });
+    const ac = new AbortController();
+    const out = await provider?.complete({ prompt: "p", system: "S", signal: ac.signal });
+    expect(out).toBe('{"facts":[],"memories":[]}');
+    expect(openaiState.apiKey).toBe("sk-oai");
+    expect(openaiState.body?.model).toBe("gpt-test");
+    expect(openaiState.options?.signal).toBe(ac.signal);
+    expect("signal" in (openaiState.body ?? {})).toBe(false);
+
+    openaiState.options = undefined;
+    await provider?.complete({ prompt: "p" });
+    expect(openaiState.options?.signal).toBeUndefined();
   });
 });

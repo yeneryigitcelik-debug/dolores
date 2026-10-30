@@ -108,7 +108,7 @@ How it works: it pulls active, embedded memories, clusters them by cosine simila
 
 ## Observability (EPIC K)
 
-The daemon exposes in-memory request metrics — no external egress (KVKK-clean):
+The daemon exposes in-memory request metrics — no external metrics exporter:
 
 - **`GET /metrics`** (JSON): uptime, total requests, `dedupRate`, per-route
   `count` / `avgMs` / `p50Ms` / `p95Ms` / `p99Ms` / `errors4xx` / `errors5xx`, DB
@@ -144,7 +144,13 @@ Lifecycle: `pending → running → done | failed`. A failed attempt is retried 
 
 **Privacy (rule 1):** `payload` (the raw text) is a transient work buffer — it is set `NULL` the instant a job reaches a terminal state (`done`/`failed`). dolores never becomes a chat-log store. A nightly `pg_cron` job (`ingest-jobs-purge`) deletes terminal job rows older than 7 days.
 
-**Concurrency & recovery:** workers claim jobs with `FOR UPDATE SKIP LOCKED` (a SECURITY DEFINER function, like the decay jobs — the worker is tenant-agnostic; per-tenant writes still run under RLS). Set `DOLORES_INGEST_WORKERS` > 1 to parallelise. On startup the worker reclaims any job stuck in `running` from a crashed run (back to `pending`). Assumes a single daemon owns the queue (architecture rule 4).
+**Concurrency & recovery:** workers claim jobs with `FOR UPDATE SKIP LOCKED` (a SECURITY DEFINER function, like the decay jobs — the worker is tenant-agnostic; per-tenant writes still run under RLS). Set `DOLORES_INGEST_WORKERS` > 1 to parallelise. Workers renew a running job's lease with a heartbeat. Startup and periodic recovery reclaim only expired leases (default 5 minutes); starting another worker does not reset active jobs. Completion/failure updates are fenced by the claimed attempt. Delivery is **at least once**: a crash can repeat a provider call or a partially persisted extraction; consumers must not assume exactly-once billing or processing.
+
+`/ingest` returns **503** when extraction is disabled or no provider is configured, before creating a job. Existing pending jobs remain pending while the worker is paused. Provider failures, invalid JSON and schema-invalid extraction responses retry with backoff instead of being acknowledged as an empty success. An intentional valid empty extraction can complete normally.
+
+Custom extraction providers must honor the optional `AbortSignal` to cancel remote work at the deadline; built-in SDK providers propagate it. The caller still returns on time if a custom provider ignores cancellation, but that remote work may continue.
+
+**Upgrade existing databases:** retain the configured admin URL and `DOLORES_APP_PASSWORD`, then run `dolores init --no-docker` to install the safe expired-lease SQL function before restarting the daemon. Without the new function recovery fails closed and logs the upgrade instruction; it never falls back to the old reset-all function. No columns or historical memory ownership are changed. Fastembed 2.1 uses a new model-cache subdirectory; the first local-embedder start after upgrading may download its model again unless that cache is already populated.
 
 ---
 
@@ -195,12 +201,17 @@ Then set `DOLORES_VECTOR_INDEX=hnsw` so recall uses `hnsw.ef_search`. Benchmark 
 | `DOLORES_EXTRACTION_MODEL` | — | LLM model ID used for async fact extraction (`ingest` command) |
 | `DOLORES_INGEST_WORKERS` | `1` | Concurrent ingest worker loops draining the durable queue |
 | `DOLORES_INGEST_POLL_MS` | `1000` | Worker idle poll interval (ms) |
-| `DOLORES_INGEST_MAX_ATTEMPTS` | `3` | Retries (exponential backoff) before a job is marked `failed` |
+| `DOLORES_INGEST_MAX_ATTEMPTS` | `3` | Total attempts, including the first, before terminal failure |
+| `DOLORES_INGEST_BASE_BACKOFF_MS` | `2000` | Base delay for exponential retry backoff |
+| `DOLORES_INGEST_LEASE_MS` | `300000` | Running lease lifetime, minimum 60000 ms |
+| `DOLORES_INGEST_HEARTBEAT_MS` | `30000` | Renewal interval, capped at half the lease and at 30000 ms for mixed worker configurations |
+| `DOLORES_INGEST_RECLAIM_MS` | `60000` | Expired-lease recovery interval, minimum 1000 ms |
+| `DOLORES_REQUEST_TIMEOUT_MS` | `60000` | CLI/MCP deadline including response body; maximum 3600000 ms |
 | `DOLORES_EXTRACTION_MIN_CONFIDENCE` | `0` | Drop extracted items whose model-reported confidence is below this (0..1); confidence-less items always kept |
 | `DOLORES_EXTRACTION_MAX_FACTS` | `20` | Maximum facts extracted per `ingest` call |
-| `DOLORES_EXTRACTION_TIMEOUT_MS` | `30000` | Timeout for a single extraction LLM call (ms) |
-| `WORKSPACE_ID` | — | Default workspace UUID for CLI operations |
-| `USER_ID` | — | Optional user UUID for per-user memory isolation |
+| `DOLORES_EXTRACTION_TIMEOUT_MS` | `30000` | Extraction deadline (ms), clamped to 300000; timed-out durable jobs retry |
+| `DOLORES_WORKSPACE_ID` | — | Default workspace UUID for CLI operations |
+| `DOLORES_USER_ID` | — | Optional user UUID for per-user memory isolation |
 
 ---
 
@@ -226,7 +237,7 @@ Set `DOLORES_AUTH_TOKEN` to a long random secret (32+ hex chars). Without it the
 openssl rand -hex 32  # generate a token
 ```
 
-Export it in `.env` (not committed) and reference it in your reverse proxy or MCP config.
+Export it in `.env` (not committed) and set the same `DOLORES_AUTH_TOKEN` for CLI/MCP clients. The clients send it on GET and POST requests. This shared transport secret does not authenticate caller-supplied workspace/user IDs; authorize those identities in the integrating application.
 
 ### Postgres port — localhost bind
 

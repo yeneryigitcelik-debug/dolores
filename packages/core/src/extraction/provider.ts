@@ -6,20 +6,38 @@
 export interface LlmProvider {
   readonly id: string;
   /** Return raw model text (expected to be a JSON object for extraction). */
-  complete(input: { prompt: string; system?: string; maxTokens?: number }): Promise<string>;
+  /**
+   * `signal` (optional) is aborted when the extraction deadline fires. Custom
+   * providers MUST honour it to cancel the actual remote work; otherwise the
+   * caller still times out but the remote call may keep running.
+   */
+  complete(input: {
+    prompt: string;
+    system?: string;
+    maxTokens?: number;
+    signal?: AbortSignal;
+  }): Promise<string>;
+}
+
+/** Per-request SDK options (second argument, never the JSON body). */
+interface SdkRequestOptions {
+  signal?: AbortSignal;
 }
 
 // Structural view of the slice of the OpenAI SDK we use (optional dependency).
 interface OpenAiChatClient {
   chat: {
     completions: {
-      create(args: {
-        model: string;
-        messages: { role: "system" | "user"; content: string }[];
-        temperature?: number;
-        max_tokens?: number;
-        response_format?: { type: "json_object" };
-      }): Promise<{ choices: { message: { content: string | null } }[] }>;
+      create(
+        args: {
+          model: string;
+          messages: { role: "system" | "user"; content: string }[];
+          temperature?: number;
+          max_tokens?: number;
+          response_format?: { type: "json_object" };
+        },
+        options?: SdkRequestOptions,
+      ): Promise<{ choices: { message: { content: string | null } }[] }>;
     };
   };
 }
@@ -67,19 +85,22 @@ export function createOpenAiProvider(opts: OpenAiProviderOptions = {}): LlmProvi
 
   return {
     id: `openai:${model}`,
-    async complete({ prompt, system, maxTokens }) {
+    async complete({ prompt, system, maxTokens, signal }) {
       if (!clientPromise) clientPromise = getClient();
       const client = await clientPromise;
       const messages: { role: "system" | "user"; content: string }[] = [];
       if (system) messages.push({ role: "system", content: system });
       messages.push({ role: "user", content: prompt });
-      const res = await client.chat.completions.create({
-        model,
-        messages,
-        temperature: 0,
-        max_tokens: maxTokens ?? 700,
-        response_format: { type: "json_object" },
-      });
+      const res = await client.chat.completions.create(
+        {
+          model,
+          messages,
+          temperature: 0,
+          max_tokens: maxTokens ?? 700,
+          response_format: { type: "json_object" },
+        },
+        signal ? { signal } : undefined,
+      );
       return res.choices[0]?.message?.content ?? "";
     },
   };
@@ -88,13 +109,16 @@ export function createOpenAiProvider(opts: OpenAiProviderOptions = {}): LlmProvi
 // Structural view of the slice of the Anthropic SDK we use (optional dependency).
 interface AnthropicMessagesClient {
   messages: {
-    create(args: {
-      model: string;
-      max_tokens: number;
-      temperature?: number;
-      system?: string;
-      messages: { role: "user" | "assistant"; content: string }[];
-    }): Promise<{ content: { type: string; text?: string }[] }>;
+    create(
+      args: {
+        model: string;
+        max_tokens: number;
+        temperature?: number;
+        system?: string;
+        messages: { role: "user" | "assistant"; content: string }[];
+      },
+      options?: SdkRequestOptions,
+    ): Promise<{ content: { type: string; text?: string }[] }>;
   };
 }
 interface AnthropicModule {
@@ -134,17 +158,20 @@ export function createAnthropicProvider(opts: AnthropicProviderOptions = {}): Ll
 
   return {
     id: `anthropic:${model}`,
-    async complete({ prompt, system, maxTokens }) {
+    async complete({ prompt, system, maxTokens, signal }) {
       if (!clientPromise) clientPromise = getClient();
       const client = await clientPromise;
-      const res = await client.messages.create({
-        model,
-        max_tokens: maxTokens ?? 700,
-        temperature: 0,
-        // Anthropic takes `system` as a top-level field, not a message role.
-        ...(system ? { system } : {}),
-        messages: [{ role: "user", content: prompt }],
-      });
+      const res = await client.messages.create(
+        {
+          model,
+          max_tokens: maxTokens ?? 700,
+          temperature: 0,
+          // Anthropic takes `system` as a top-level field, not a message role.
+          ...(system ? { system } : {}),
+          messages: [{ role: "user", content: prompt }],
+        },
+        signal ? { signal } : undefined,
+      );
       // Concatenate text blocks (Claude returns a content-block array).
       return res.content
         .filter((b) => b.type === "text" && typeof b.text === "string")

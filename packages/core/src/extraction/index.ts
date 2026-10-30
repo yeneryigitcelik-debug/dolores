@@ -1,7 +1,10 @@
 export {
+  ExtractionError,
   extractFromText,
   ingestText,
   isExtractionEnabled,
+  resolveExtractionProvider,
+  type ExtractionErrorCode,
   type ExtractionOptions,
   type ExtractionResult,
   type IngestSummary,

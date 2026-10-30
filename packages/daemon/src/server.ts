@@ -8,6 +8,7 @@ import {
   type HealthResponse,
   type IngestResponse,
   type IngestStatusResponse,
+  type LlmProvider,
   type MemoryContext,
   type PruneResponse,
   type RecallResponse,
@@ -16,6 +17,7 @@ import {
   buildContext,
   consolidateMemories,
   createEmbedder,
+  createLlmProviderFromEnv,
   createReranker,
   enqueueIngestJob,
   getIngestJobStatus,
@@ -39,16 +41,21 @@ import { type IngestWorkerHandle, startIngestWorkers } from "./worker.js";
 const scopeSchema = z.enum(["personal", "workspace"]);
 
 const ctxSchema = z.object({
-  workspaceId: z.string().uuid("workspaceId must be a UUID"),
-  userId: z.string().uuid().nullable().optional(),
+  workspaceId: z.guid("workspaceId must be a UUID"),
+  userId: z.guid().nullable().optional(),
 });
 
-const rememberBodySchema = ctxSchema.extend({
-  content: z.string().min(1, "content must be non-empty").max(50_000),
-  scope: scopeSchema.optional(),
-  importance: z.number().int().min(1).max(10).optional(),
-  source: z.string().optional(),
-});
+const rememberBodySchema = ctxSchema
+  .extend({
+    content: z.string().min(1, "content must be non-empty").max(50_000),
+    scope: scopeSchema.optional(),
+    importance: z.number().int().min(1).max(10).optional(),
+    source: z.string().optional(),
+  })
+  .refine((body) => body.scope !== "personal" || Boolean(body.userId), {
+    message: "personal scope requires userId",
+    path: ["userId"],
+  });
 
 const recallBodySchema = ctxSchema.extend({
   query: z.string().min(1, "query must be non-empty").max(2_000),
@@ -73,12 +80,17 @@ const factsListBodySchema = ctxSchema.extend({
   category: z.string().optional(),
 });
 
-const factsUpsertBodySchema = ctxSchema.extend({
-  category: z.string().min(1),
-  key: z.string().min(1),
-  value: z.string().min(1),
-  scope: scopeSchema.optional(),
-});
+const factsUpsertBodySchema = ctxSchema
+  .extend({
+    category: z.string().min(1),
+    key: z.string().min(1),
+    value: z.string().min(1),
+    scope: scopeSchema.optional(),
+  })
+  .refine((body) => body.scope !== "personal" || Boolean(body.userId), {
+    message: "personal scope requires userId",
+    path: ["userId"],
+  });
 
 const ingestBodySchema = ctxSchema.extend({
   text: z.string().min(1, "text must be non-empty").max(100_000),
@@ -86,7 +98,7 @@ const ingestBodySchema = ctxSchema.extend({
 });
 
 const ingestStatusBodySchema = ctxSchema.extend({
-  jobId: z.string().uuid("jobId must be a UUID"),
+  jobId: z.guid("jobId must be a UUID"),
 });
 
 const pruneBodySchema = ctxSchema.extend({
@@ -263,6 +275,9 @@ export async function createApp(
   // Optional superuser pool for /status global counts — bypasses RLS.
   // Retrieval/recall/remember still use `pool` (app user + RLS).
   adminPool?: Pool,
+  // Extraction provider for /ingest availability. undefined = resolve from env
+  // once (only when extraction is enabled); null = explicitly unavailable.
+  extractionProvider?: LlmProvider | null,
 ): Promise<FastifyInstance> {
   const logLevel = process.env.DOLORES_LOG_LEVEL ?? "info";
   const app = Fastify({ logger: { level: logLevel } });
@@ -270,6 +285,16 @@ export async function createApp(
   // Optional final-stage reranker (EPIC H). Created once; NoOp unless
   // DOLORES_RERANKER selects a concrete local reranker. Stays off the LLM path.
   const reranker = createReranker(process.env.DOLORES_RERANKER);
+
+  // Resolved ONCE. /ingest refuses (503) instead of queueing work no worker can
+  // ever distil.
+  const resolvedExtractionProvider: LlmProvider | null =
+    extractionProvider !== undefined
+      ? extractionProvider
+      : config.extractionEnabled
+        ? createLlmProviderFromEnv()
+        : null;
+  const extractionAvailable = config.extractionEnabled && resolvedExtractionProvider !== null;
 
   // ---------- Metrics state ----------
   const metricsStartedAt = Date.now();
@@ -515,6 +540,14 @@ export async function createApp(
         },
       });
     }
+    if (!extractionAvailable) {
+      return reply.status(503).send({
+        error: {
+          code: "EXTRACTION_UNAVAILABLE",
+          message: "Extraction is disabled or no LLM provider is configured",
+        },
+      });
+    }
     const { workspaceId, userId, text, source } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
@@ -676,7 +709,9 @@ export async function startDaemon(config: DaemonRuntimeConfig): Promise<void> {
   // Create app before embedder.ready() so app.log is available for startup
   // messages. Route handlers only execute after app.listen() returns, by which
   // time embedder.ready() has completed.
-  const app = await createApp(pool, embedder, config, adminPool);
+  // Resolve the extraction provider once and share it with the app + worker.
+  const extractionProvider = config.extractionEnabled ? createLlmProviderFromEnv() : null;
+  const app = await createApp(pool, embedder, config, adminPool, extractionProvider);
 
   app.log.info({ embedderId: embedder.id }, "loading embedder");
   await embedder.ready();
@@ -689,6 +724,7 @@ export async function startDaemon(config: DaemonRuntimeConfig): Promise<void> {
     embedder,
     extractionEnabled: config.extractionEnabled,
     log: app.log,
+    provider: extractionProvider,
   });
 
   setupGracefulShutdown(app, pool, embedder, ingestWorker, adminPool);

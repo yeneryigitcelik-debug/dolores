@@ -1,9 +1,15 @@
 export {
+  DEFAULT_INGEST_LEASE_MS,
+  IngestQueueUpgradeRequiredError,
+  MIN_INGEST_LEASE_MS,
+  clampIngestLeaseMs,
   enqueueIngestJob,
   claimIngestJob,
   completeIngestJob,
   failIngestJob,
   getIngestJobStatus,
+  reclaimExpiredIngestJobs,
   reclaimRunningIngestJobs,
+  renewIngestJobLease,
   type ClaimedIngestJob,
 } from "./jobs.js";

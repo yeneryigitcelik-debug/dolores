@@ -36,7 +36,23 @@ interface Candidate {
   content: string;
   importance: number;
   scope: string;
+  /** Actual stored owner (may differ from ctx user, incl. legacy rows). */
+  userId: string | null;
   embedding: number[];
+  // Yeniden kontrol için ham, kararlı anlık görüntü alanları (vektör yeniden üretilmez).
+  rawEmbedding: string;
+  source: string | null;
+}
+
+// Kilit altında yeniden okunan satırın ham alanları.
+interface SnapshotRow {
+  id: string;
+  content: string;
+  importance: number;
+  scope: string;
+  user_id: string | null;
+  emb: string | null;
+  source: string | null;
 }
 
 const SYNTH_SYSTEM = `You merge several related memory notes into ONE concise note for an AI assistant.
@@ -61,7 +77,7 @@ function cluster(items: Candidate[], threshold: number, minSize: number): Candid
     for (let j = i + 1; j < items.length; j++) {
       if (visited.has(j)) continue;
       const other = items[j];
-      if (!other || other.scope !== seed.scope) continue;
+      if (!other || other.scope !== seed.scope || other.userId !== seed.userId) continue;
       if (cosine(seed.embedding, other.embedding) >= threshold) {
         group.push(other);
         visited.add(j);
@@ -70,6 +86,19 @@ function cluster(items: Candidate[], threshold: number, minSize: number): Candid
     if (group.length >= minSize) clusters.push(group);
   }
   return clusters;
+}
+
+// Anlık görüntü ile kilitli satırı birebir karşılaştırır (metin/sayı/null tam eşitlik).
+function snapshotMatches(original: Candidate, row: SnapshotRow): boolean {
+  return (
+    row.content === original.content &&
+    Number(row.importance) === Number(original.importance) &&
+    row.scope === original.scope &&
+    (row.user_id ?? null) === original.userId &&
+    row.emb !== null &&
+    row.emb === original.rawEmbedding &&
+    (row.source ?? null) === original.source
+  );
 }
 
 export async function consolidateMemories(
@@ -88,7 +117,7 @@ export async function consolidateMemories(
   // 1. Pull active, embedded candidates (RLS-scoped).
   const items = await withTenant(pool, ctx, async (client) => {
     const params: unknown[] = [ctx.workspaceId];
-    let sql = `SELECT id, content, importance, scope, embedding::text AS emb
+    let sql = `SELECT id, content, importance, scope, user_id::text AS user_id, embedding::text AS emb, source
                  FROM memories
                 WHERE superseded_by IS NULL AND embedding IS NOT NULL AND workspace_id = $1`;
     if (opts.scope) {
@@ -102,15 +131,22 @@ export async function consolidateMemories(
       content: string;
       importance: number;
       scope: string;
+      user_id: string | null;
       emb: string;
+      source: string | null;
     }>(sql, params);
-    return res.rows.map((r) => ({
-      id: r.id,
-      content: r.content,
-      importance: r.importance,
-      scope: r.scope,
-      embedding: parseVectorLiteral(r.emb),
-    }));
+    return res.rows.map(
+      (r): Candidate => ({
+        id: r.id,
+        content: r.content,
+        importance: r.importance,
+        scope: r.scope,
+        userId: r.user_id ?? null,
+        embedding: parseVectorLiteral(r.emb),
+        rawEmbedding: r.emb,
+        source: r.source ?? null,
+      }),
+    );
   });
 
   const summary: ConsolidationSummary = {
@@ -155,10 +191,41 @@ export async function consolidateMemories(
     }
 
     const importance = clampImportance(Math.max(...members.map((m) => m.importance)));
-    const memberScope = (members[0]?.scope ?? "personal") as Scope;
+    const first = members[0];
+    if (!first) continue;
+    // Owner comes from the members (same physical owner/scope), never from ctx.
+    const memberScope = first.scope as Scope;
+    const memberUserId = first.userId;
+    const memberIds = members.map((m) => m.id);
 
-    // 4. Insert the consolidation (active) + supersede members (short transaction).
-    await withTenant(pool, ctx, async (client) => {
+    // 4. Lock + recheck members (they may have changed during the slow LLM call),
+    //    then insert the consolidation + supersede members (short transaction).
+    const applied = await withTenant(pool, ctx, async (client) => {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2::text, '') || ':' || $3))",
+        [ctx.workspaceId, memberUserId, memberScope],
+      );
+      // Kararlı alanların tamamını kilitleyerek yeniden oku; inplace remember
+      // güncellemelerini (içerik/önem/gömme/kaynak değişimi) yakalamak için.
+      const locked = await client.query<SnapshotRow>(
+        `SELECT id, content, importance, scope, user_id::text AS user_id,
+                embedding::text AS emb, source
+           FROM memories
+          WHERE id = ANY($1::uuid[]) AND workspace_id = $2 AND scope = $3
+            AND user_id IS NOT DISTINCT FROM $4::uuid AND superseded_by IS NULL
+          FOR UPDATE`,
+        [memberIds, ctx.workspaceId, memberScope, memberUserId],
+      );
+      if (locked.rows.length !== new Set(memberIds).size) return false;
+
+      // Kimliğe göre eşleştir; herhangi bir üye eksik veya değişmişse hiçbir yazma yapma.
+      const byId = new Map<string, SnapshotRow>();
+      for (const row of locked.rows) byId.set(row.id, row);
+      for (const m of members) {
+        const row = byId.get(m.id);
+        if (!row || !snapshotMatches(m, row)) return false;
+      }
+
       const ins = await client.query<{ id: string }>(
         `INSERT INTO memories (workspace_id, user_id, scope, content, importance, source, embedding)
          VALUES ($1, $2, $3, $4, $5, 'consolidation', ${vector ? "$6::vector" : "NULL"})
@@ -166,23 +233,25 @@ export async function consolidateMemories(
         vector
           ? [
               ctx.workspaceId,
-              ctx.userId ?? null,
+              memberUserId,
               memberScope,
               consolidated,
               importance,
               toVectorLiteral(vector),
             ]
-          : [ctx.workspaceId, ctx.userId ?? null, memberScope, consolidated, importance],
+          : [ctx.workspaceId, memberUserId, memberScope, consolidated, importance],
       );
       const newId = ins.rows[0]?.id;
-      if (!newId) return;
+      if (!newId) return false;
       const res = await client.query(
         `UPDATE memories SET superseded_by = $1, valid_to = now()
           WHERE id = ANY($2::uuid[]) AND superseded_by IS NULL`,
         [newId, members.map((m) => m.id)],
       );
       summary.superseded += res.rowCount ?? 0;
+      return true;
     });
+    if (!applied) continue;
     summary.consolidated += 1;
     processed += 1;
   }

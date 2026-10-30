@@ -132,7 +132,7 @@ export type RerankerKind = "noop";
 
 export interface RememberInput {
   content: string;
-  /** default "personal" */
+  /** Omit: personal with a userId, workspace otherwise; explicit personal requires userId. */
   scope?: Scope;
   /** 1..10, default 5 */
   importance?: number;

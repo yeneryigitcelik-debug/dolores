@@ -15,7 +15,7 @@ export async function runRemember(content: string, opts: RememberOptions): Promi
   const body: RememberRequest = {
     ...ctx,
     content,
-    scope: (opts.scope as Scope | undefined) ?? "personal",
+    scope: opts.scope as Scope | undefined,
     importance: opts.importance,
     source: opts.source,
   };

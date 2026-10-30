@@ -44,7 +44,7 @@ program
 program
   .command("remember <content>")
   .description("Yeni bir bellek kaydet")
-  .option("--scope <scope>", "personal veya workspace (varsayılan: personal)", "personal")
+  .option("--scope <scope>", "personal veya workspace (varsayılan: kullanıcı varsa personal)")
   .option(
     "--importance <n>",
     "1..10 önem skoru (varsayılan: 5)",
