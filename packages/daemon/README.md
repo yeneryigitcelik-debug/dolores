@@ -1,7 +1,6 @@
 # @dolores/daemon
 
-Long-running HTTP service that owns the single Postgres pool and the embedding
-model. CLI and MCP packages are thin HTTP clients of this daemon.
+Long-running HTTP service that owns the tenant Postgres pool, optional admin maintenance pool, and embedding model. CLI and MCP packages are thin HTTP clients of this daemon.
 
 ## Startup
 
@@ -14,17 +13,17 @@ node packages/daemon/dist/index.js
 ```
 
 The daemon:
-1. Loads the embedding model **once** (no per-request cold-start).
-2. Opens a single `pg.Pool` as the `dolores_app` non-superuser → RLS is enforced on every query.
+1. Checks that the runtime database role cannot bypass RLS and that tenant tables enable and force it. An unsafe connection fails before model loading, workers, or listening.
+2. Loads and validates the embedding model **once** (no per-request cold-start); local output must be finite and 384-dimensional.
 3. Does **not** run migrations — run `dolores init` (CLI) first.
-4. Binds only to `127.0.0.1` (never 0.0.0.0) for security.
+4. Binds to `127.0.0.1` by default. A non-loopback bind requires `DOLORES_AUTH_TOKEN`; clients must send it as a Bearer token.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `DOLORES_APP_DATABASE_URL` | — | App role connection string (**required**, enables RLS). Falls back to `DATABASE_URL`. |
-| `DATABASE_URL` | — | Fallback DB URL (used if `DOLORES_APP_DATABASE_URL` is not set). |
+| `DATABASE_URL` | — | Admin/migration URL; optional runtime maintenance pool. A runtime fallback to a superuser URL is rejected by the preflight. |
 | `DOLORES_DAEMON_HOST` | `127.0.0.1` | Bind address. |
 | `DOLORES_DAEMON_PORT` | `4505` | Listen port. |
 | `DOLORES_EMBEDDER` | `local` | `local` \| `openai` \| `noop`. |
@@ -47,15 +46,17 @@ drive Postgres RLS tenant isolation. Request body type errors return **400**.
 | `POST` | `/context` | Build a system-prompt blob (facts + memories) under a token budget. |
 | `POST` | `/facts/list` | List structured facts, optionally filtered by `category`. |
 | `POST` | `/facts/upsert` | Insert or update a fact (last-writer-wins on `(workspace, user, category, key)`). |
-| `POST` | `/ingest` | Fire-and-forget: extract facts + memories from raw text via LLM (async, graceful if disabled). |
-| `POST` | `/prune` | Conservative prune: soften stale memories (>30 days), delete abandoned ones (>90 days, importance<3). Supports `dryRun`. |
+| `POST` | `/ingest` | Enqueue durable extraction and return 202 with a job ID. Disabled/unavailable extraction returns 503. Delivery is at least once. |
+| `POST` | `/ingest/status` | Read the caller-visible job state by `jobId`; no mutation or retry. |
+| `POST` | `/prune` | Preview by default (`dryRun: true`). Conservative mode only softens; aggressive mode may also delete eligible unreferenced rows. Explicit `dryRun: false` applies. |
 
 ## Graceful shutdown
 
 On `SIGTERM` or `SIGINT`:
 
 1. Fastify stops accepting new connections and drains in-flight handlers (including any ONNX/fastembed ops).
-2. The Postgres pool ends (waits for in-flight queries).
-3. `process.exit(0)` — **no** `libc++abi: mutex lock failed` crash from onnxruntime.
+2. Ingest workers finish their current work and stop claiming new jobs.
+3. The native embedding session is released, then both Postgres pools end.
+4. The event loop drains naturally with exit code 0; no forced successful `process.exit()` runs ONNX destructors during active native work.
 
 A 30-second safety timer forces `process.exit(1)` if draining stalls.

@@ -1,6 +1,6 @@
 # @dolores/cli
 
-Command-line interface for the dolores agent memory system. Provides `dolores init`, `dolores remember`, `dolores recall`, `dolores context`, and `dolores ingest` commands that talk to the dolores daemon over localhost HTTP.
+Command-line interface for the dolores agent memory system. Provides `dolores init`, `dolores remember`, `dolores recall`, `dolores context`, `dolores ingest`, and `dolores ingest-status` commands. Runtime commands talk to the daemon over HTTP; `init` uses the admin database connection.
 
 Install globally and use from any terminal once the daemon is running.
 
@@ -9,7 +9,11 @@ npm i -g @dolores/cli
 dolores init       # set up Postgres schema
 dolores remember "We deploy on Hetzner."
 dolores recall "where is production?"
+dolores ingest conversation.txt
+dolores ingest-status <jobId> --json
 ```
+
+`ingest-status` reads the existing job without retrying or changing it. The four statuses are `pending`, `running`, `done`, and `failed`. A valid status response exits successfully even for a failed job; malformed input, unavailable/unauthorized responses, and timeouts exit with code 1. `--json` prints one validated object with ID, status, attempts, error, and timestamps.
 
 ## Korumalı daemon bağlantısı
 
