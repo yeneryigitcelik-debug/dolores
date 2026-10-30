@@ -118,13 +118,16 @@ dolores init                      # DB kurulumu: extension, migration, RLS, pg_c
 dolores remember "<metin>"        # bir anı ekle   (--scope, --importance, --source)
 dolores recall   "<sorgu>"        # hibrit vektör + full-text arama
 dolores context                   # system prompt'a inject edilecek minimal bağlam bloğu
+dolores ingest-status <jobId>      # kuyruktaki işi sorgula; script'ler için --json ekle
 dolores ingest   <dosya|stdin>    # bir konuşmadan fact + memory damıt (async)
 dolores facts    [--category …]   # yapısal fact'leri listele
-dolores prune    [--dry-run]      # manuel temizlik
+dolores prune    [--dry-run | --confirm] # varsayılan önizleme; --confirm uygular
 dolores status                    # daemon + DB sağlığı, sayılar, tahmini token tasarrufu
 ```
 
 `dolores context` öne çıkan komuttur: bir agent başlarken çalıştırın ve çıktısını system prompt'a pipe edin. Agent "kim olduğunu" minimal token'la öğrenir.
+
+Bağlam bütçesi başlık ve ayraçları da içerir; token tahmini `ceil(karakter sayısı / 4)` ile yapılır. Bu, paketleme yaklaşımıdır; sağlayıcının tokenizer'ı değildir. Yerel embedder hazır olmadan önce sonlu, 384 boyutlu çıktı ürettiğini doğrular; bilinmeyen veya uyumsuz modeller açık hata verir.
 
 ## MCP (Claude Code / Cursor)
 
@@ -159,9 +162,13 @@ Artık bellek pasif bir depo değil — agent'ın oturumlar boyunca aktif kullan
 
 **İzolasyon ve kimlik.** Daemon non-superuser uygulama rolünü kullandığında RLS, her transaction'ı sağlanan workspace ve kullanıcıyla sınırlar. Kimlikler çağıran istemciden gelir: ortak Bearer token bağlantı erişimini denetler, kullanıcı hesabını bu kimliklere bağlamaz. Birbirine güvenmeyen kullanıcılara hizmet veren uygulama kendi sınırında kimlik doğrulamalı ve yetkili kimlikleri sağlamalıdır.
 
+Daemon açılışta runtime rolünün RLS'yi atlayamadığını ve `facts`, `memories`, `ingest_jobs` tablolarının RLS'yi zorunlu tuttuğunu denetler. Güvensiz bağlantı; model, worker veya HTTP dinleyicisi başlamadan reddedilir. Runtime için `DOLORES_APP_DATABASE_URL`, migration ve kuyruk bakımı için admin `DATABASE_URL` kullanın.
+
 Yeni yazımlarda `scope: "workspace"`, çağıranın kullanıcı kimliği olsa bile `user_id = NULL` olarak saklanır ve workspace ile paylaşılır. `scope: "personal"` kullanıcı kimliği gerektirir. Scope verilmezse kimliği olan çağıran için personal, diğer durumda workspace seçilir. CLI, MCP, core API, fact ve memory yazımları aynı kuralı izler. Önceden kullanıcıya bağlı kayıtların sahipliği korunur; güncelleme eski verileri paylaşılabilir hale getirmez. Yakın kopya eşleştirme ve consolidation fiziksel sahipliği korur.
 
 **Decay.** Günlük bir `pg_cron` işi, eski ve geri çağrılmayan anıların önemini yumuşatır — insan belleği gibi. Silme **varsayılan kapalıdır** (`DOLORES_DECAY_MODE=conservative`); agresif silme politikası opt-in'dir.
+
+Decay modunu değiştirdikten sonra `dolores init --no-docker` komutunu yeniden çalıştırın: muhafazakâr kurulum, önceden planlanmış agresif işi kaldırır. Temizlik, sürüm geçmişindeki başka bir kaydın işaret ettiği anıları korur. Doğrudan `POST /prune` isteğinde `dryRun` verilmezse önizleme yapılır; uygulamak için `dryRun: false` gönderin. CLI varsayılan olarak önizleme yapar; uygulamak için `--confirm` gerekir.
 
 ## Nereye Oturur
 

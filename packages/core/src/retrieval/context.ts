@@ -9,6 +9,9 @@ import { tokenEstimate } from "./tokens.js";
 /** How many candidate memories to consider before token-budget trimming. */
 const MEMORY_CANDIDATES = 50;
 
+/** Characters per token, matching tokenEstimate = ceil(length / 4). */
+const CHARS_PER_TOKEN = 4;
+
 const FACT_SELECT =
   "SELECT id, workspace_id, user_id, scope, category, key, value, created_at, updated_at FROM facts ORDER BY category, key";
 
@@ -78,47 +81,50 @@ export async function buildContext(
 }
 
 /**
+ * Convert a caller token budget into a hard character cap such that
+ * ceil(chars / 4) <= budget. NaN / non-positive → 0; +Infinity → uncapped;
+ * fractional budgets are floored.
+ */
+function budgetToMaxChars(maxTokens: number): number {
+  if (Number.isNaN(maxTokens) || maxTokens <= 0) return 0;
+  if (maxTokens === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
+  return Math.floor(maxTokens) * CHARS_PER_TOKEN;
+}
+
+/**
  * Pure renderer (DB-free, unit-testable). Greedily packs facts then memories
- * under the token budget. Section headers are only emitted when at least one
- * item of that section fits, so there are never dangling headers.
+ * under the token budget. Accounting is exact on characters (including the
+ * section headers and every newline separator), so the returned estimate
+ * always equals tokenEstimate(text) and never exceeds a finite budget. Section
+ * headers are only emitted when at least one item of that section fits.
  */
 export function renderContext(
   facts: Fact[],
   memories: RenderMemory[],
   maxTokens: number,
 ): BuiltContext {
+  const maxChars = budgetToMaxChars(maxTokens);
   const lines: string[] = [];
-  let budget = maxTokens;
+  let used = 0;
 
-  const factHeader = "# Facts";
-  let factHeaderAdded = false;
-  for (const f of facts) {
-    const line = `- [${f.category}] ${f.key}: ${f.value}`;
-    const cost = tokenEstimate(line) + (factHeaderAdded ? 0 : tokenEstimate(factHeader));
-    if (cost > budget) break;
-    if (!factHeaderAdded) {
-      lines.push(factHeader);
-      budget -= tokenEstimate(factHeader);
-      factHeaderAdded = true;
+  const pack = <T>(header: string, items: readonly T[], render: (item: T) => string): void => {
+    let headerAdded = false;
+    for (const item of items) {
+      const line = render(item);
+      const sep = lines.length > 0 ? 1 : 0;
+      const extra = headerAdded ? sep + line.length : sep + header.length + 1 + line.length;
+      if (used + extra > maxChars) break;
+      if (!headerAdded) {
+        lines.push(header);
+        headerAdded = true;
+      }
+      lines.push(line);
+      used += extra;
     }
-    lines.push(line);
-    budget -= tokenEstimate(line);
-  }
+  };
 
-  const memHeader = "# Memories";
-  let memHeaderAdded = false;
-  for (const m of memories) {
-    const line = `- (${m.importance}) ${m.content}`;
-    const cost = tokenEstimate(line) + (memHeaderAdded ? 0 : tokenEstimate(memHeader));
-    if (cost > budget) break;
-    if (!memHeaderAdded) {
-      lines.push(memHeader);
-      budget -= tokenEstimate(memHeader);
-      memHeaderAdded = true;
-    }
-    lines.push(line);
-    budget -= tokenEstimate(line);
-  }
+  pack("# Facts", facts, (f) => `- [${f.category}] ${f.key}: ${f.value}`);
+  pack("# Memories", memories, (m) => `- (${m.importance}) ${m.content}`);
 
   const text = lines.join("\n");
   return { text, tokenEstimate: tokenEstimate(text) };

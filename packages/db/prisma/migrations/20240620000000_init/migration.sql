@@ -184,7 +184,12 @@ BEGIN
 END;
 $$;
 
-GRANT CONNECT ON DATABASE dolores TO dolores_app;
+-- CONNECT on the database being migrated (alternate names supported).
+DO $$
+BEGIN
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO dolores_app', current_database());
+END;
+$$;
 GRANT USAGE ON SCHEMA public TO dolores_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE memories, facts TO dolores_app;
 
@@ -216,9 +221,28 @@ CREATE OR REPLACE FUNCTION dolores_decay_memories()
   SET search_path = public
 AS $$
 BEGIN
-  DELETE FROM memories
-   WHERE importance < 3
-     AND last_accessed < now() - INTERVAL '90 days';
+  -- Protect any memory referenced by another row's superseded_by (deleting it
+  -- would SET NULL the predecessor and make it falsely active). This file has no
+  -- superseded_by column itself, so the protected form is only used once the
+  -- column exists (applyMigrations adds it); plpgsql plans each branch lazily.
+  IF EXISTS (
+    SELECT 1 FROM pg_attribute
+     WHERE attrelid = 'public.memories'::regclass
+       AND attname = 'superseded_by'
+       AND NOT attisdropped
+  ) THEN
+    DELETE FROM memories m
+     WHERE m.importance < 3
+       AND m.last_accessed < now() - INTERVAL '90 days'
+       AND NOT EXISTS (
+         SELECT 1 FROM memories predecessor
+          WHERE predecessor.superseded_by = m.id
+       );
+  ELSE
+    DELETE FROM memories m
+     WHERE m.importance < 3
+       AND m.last_accessed < now() - INTERVAL '90 days';
+  END IF;
 END;
 $$;
 

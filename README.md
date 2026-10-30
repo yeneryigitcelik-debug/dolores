@@ -118,13 +118,16 @@ dolores init                      # DB setup: extensions, migration, RLS, pg_cro
 dolores remember "<text>"         # add a memory   (--scope, --importance, --source)
 dolores recall   "<query>"        # hybrid vector + full-text search
 dolores context                   # minimal context blob to inject into a system prompt
+dolores ingest-status <jobId>      # inspect a queued job; add --json for scripts
 dolores ingest   <file|stdin>     # distill facts + memories from a conversation (async)
 dolores facts    [--category …]   # list structured facts
-dolores prune    [--dry-run]      # manual cleanup
+dolores prune    [--dry-run | --confirm] # preview by default; --confirm applies cleanup
 dolores status                    # daemon + DB health, counts, estimated token savings
 ```
 
 `dolores context` is the killer command: run it when an agent starts and pipe its output into the system prompt. The agent learns "who it is" for minimal tokens.
+
+The context budget includes headings and separators and uses `ceil(characters / 4)` as its token estimate. This is a packing heuristic, not a provider tokenizer. The local embedder validates finite 384-dimensional output before becoming ready; unknown or incompatible models fail explicitly.
 
 ## MCP (Claude Code / Cursor)
 
@@ -159,9 +162,13 @@ Now memory is not a passive store — it's a tool the agent actively uses across
 
 **Isolation and identity.** RLS restricts each transaction to its supplied workspace and user when the daemon uses the non-superuser app role. The daemon trusts caller-supplied IDs: a shared Bearer token controls transport access and does not bind a caller to an account. An application serving mutually untrusted users must authenticate them and supply authorized IDs at its boundary.
 
+Daemon startup checks that its runtime role cannot bypass RLS and that `facts`, `memories`, and `ingest_jobs` enforce it. An unsafe connection fails before model loading, workers, or HTTP listening. Use `DOLORES_APP_DATABASE_URL` for runtime and keep the admin `DATABASE_URL` for migrations and queue maintenance.
+
 For new writes, `scope: "workspace"` stores `user_id = NULL` and is shared with the workspace, including when the caller has a user ID. `scope: "personal"` requires a user ID. Omitting scope selects personal for an identified caller and workspace otherwise. CLI, MCP, direct core calls, facts and memories follow this rule. Existing owner-bound records retain their ownership; this upgrade does not declassify old data. Near-duplicate matching and consolidation respect physical ownership.
 
 **Decay.** A daily `pg_cron` job softens the importance of stale, un-recalled memories — like human memory. Deletion is **off by default** (`DOLORES_DECAY_MODE=conservative`); the aggressive delete policy is opt-in.
+
+Re-run `dolores init --no-docker` after changing decay mode: conservative initialization removes a previously scheduled aggressive job. Cleanup retains any memory referenced by version history. Direct `POST /prune` requests default to a preview when `dryRun` is omitted; pass `dryRun: false` to apply. The CLI previews by default and requires `--confirm` to apply.
 
 ## Where it fits
 

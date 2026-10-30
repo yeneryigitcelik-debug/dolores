@@ -28,11 +28,47 @@ import {
   withTenant,
 } from "@dolores/core";
 import Fastify, { type FastifyError, type FastifyInstance } from "fastify";
-import { Pool } from "pg";
+import type { Pool } from "pg";
 import { z } from "zod";
 import type { DaemonRuntimeConfig } from "./config.js";
+import {
+  PoolErrorSink,
+  assertAppDatabaseIsolation,
+  attachPoolErrorHandler,
+  createDaemonPool,
+  sanitizeErrorCode,
+} from "./database.js";
 import { MetricsCollector, type RouteMetricView } from "./metrics.js";
 import { type IngestWorkerHandle, startIngestWorkers } from "./worker.js";
+
+// ---------------------------------------------------------------------------
+// asOf normalization (D8)
+// ---------------------------------------------------------------------------
+
+// Only plain 4-digit years survive as a PostgreSQL-castable ISO timestamp;
+// expanded years (+275760-..., -000001-...) and year 0000 do not.
+const PG_SAFE_ISO_UTC = /^(\d{4})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * Normalize an asOf input with the EXISTING Date.parse semantics into a full
+ * ISO-8601 UTC timestamp. Date-only strings ('YYYY-MM-DD') are UTC midnight per
+ * ECMAScript, so the value no longer depends on the PostgreSQL session TimeZone
+ * at cast time. Returns null for unparseable or out-of-range input (-> 400).
+ */
+export function normalizeAsOf(raw: string): string | null {
+  const ms = Date.parse(raw);
+  if (!Number.isFinite(ms)) return null;
+  let iso: string;
+  try {
+    iso = new Date(ms).toISOString();
+  } catch {
+    return null;
+  }
+  const match = PG_SAFE_ISO_UTC.exec(iso);
+  const year = Number(match?.[1] ?? "0");
+  if (!match || year < 1) return null;
+  return iso;
+}
 
 // ---------------------------------------------------------------------------
 // Zod schemas for request bodies
@@ -63,10 +99,22 @@ const recallBodySchema = ctxSchema.extend({
   scope: scopeSchema.optional(),
   minImportance: z.number().int().min(1).max(10).optional(),
   // Temporal evolution (EPIC F). asOf accepts a date ('YYYY-MM-DD') or full ISO
-  // timestamp — anything Date.parse understands, cast to timestamptz downstream.
+  // timestamp (anything Date.parse understands). The schema TRANSFORMS it to the
+  // normalized full ISO UTC string, so parsed.data never carries raw input to SQL;
+  // values that cannot be represented are a 400.
   asOf: z
     .string()
-    .refine((s) => !Number.isNaN(Date.parse(s)), "asOf must be an ISO date or datetime")
+    .transform((s, ctx) => {
+      const normalized = normalizeAsOf(s);
+      if (normalized === null) {
+        ctx.addIssue({
+          code: "custom",
+          message: "asOf must be an ISO date or datetime between years 0001 and 9999",
+        });
+        return z.NEVER;
+      }
+      return normalized;
+    })
     .optional(),
   includeSuperseded: z.boolean().optional(),
 });
@@ -110,12 +158,28 @@ const consolidateBodySchema = ctxSchema.extend({
 });
 
 // ---------------------------------------------------------------------------
-// Prune helper (not in @dolores/core — daemon-only logic)
+// Prune helper (not in @dolores/core, daemon-only logic)
 // ---------------------------------------------------------------------------
 
+// Defense in depth: explicit tenant predicates mirroring the RLS policy
+// (workspace-shared rows + the caller's own personal rows, never another
+// user/tenant). Even a privileged pool that bypasses RLS cannot prune others.
+// $1 = workspaceId, $2 = userId (NULL -> shared rows only, exactly like RLS).
+// These fragments are constants; user input only ever travels as parameters.
+const PRUNE_VISIBLE = "m.workspace_id = $1::uuid AND (m.user_id IS NULL OR m.user_id = $2::uuid)";
+const PRUNE_SOFTEN_ELIGIBLE = "m.last_accessed < NOW() - INTERVAL '30 days' AND m.importance > 1";
+const PRUNE_STALE_FOR_DELETE = "m.last_accessed < NOW() - INTERVAL '90 days'";
+// Never delete a memory that another row points at via superseded_by: the FK's
+// ON DELETE SET NULL would silently resurrect that predecessor as ACTIVE.
+const PRUNE_NO_INCOMING_SUPERSESSION =
+  "NOT EXISTS (SELECT 1 FROM memories pred WHERE pred.superseded_by = m.id)";
+
 // conservative = soften only (importance GREATEST(1,importance-1)); NEVER delete.
-// aggressive   = soften + delete (importance<3 AND last_accessed 90d+).
-// dryRun reports REAL candidate counts without modifying any rows.
+// aggressive   = soften, THEN delete (importance<3 AND last_accessed 90d+).
+// dryRun reports the EXACT counts the real run would produce without writing.
+// Because the real run softens first, a row older than 90 days with OLD
+// importance 3 drops to 2 and is then deleted, so the preview must count
+// old importance <= 3 (old 1 stays 1, 2->1, 3->2; 4->3 survives).
 async function runPrune(
   pool: Pool,
   ctx: MemoryContext,
@@ -124,34 +188,41 @@ async function runPrune(
 ): Promise<{ softened: number; deleted: number }> {
   let softened = 0;
   let deleted = 0;
+  const params = [ctx.workspaceId, ctx.userId ?? null];
 
   await withTenant(pool, ctx, async (client) => {
     if (dryRun) {
       const softenRes = await client.query<{ count: string }>(
-        `SELECT COUNT(*) AS count FROM memories
-         WHERE last_accessed < NOW() - INTERVAL '30 days' AND importance > 1`,
+        `SELECT COUNT(*) AS count FROM memories m
+          WHERE ${PRUNE_VISIBLE} AND ${PRUNE_SOFTEN_ELIGIBLE}`,
+        params,
       );
       softened = Number.parseInt(softenRes.rows[0]?.count ?? "0", 10);
 
       if (mode === "aggressive") {
         const deleteRes = await client.query<{ count: string }>(
-          `SELECT COUNT(*) AS count FROM memories
-           WHERE last_accessed < NOW() - INTERVAL '90 days' AND importance < 3`,
+          `SELECT COUNT(*) AS count FROM memories m
+            WHERE ${PRUNE_VISIBLE} AND ${PRUNE_STALE_FOR_DELETE}
+              AND m.importance <= 3 AND ${PRUNE_NO_INCOMING_SUPERSESSION}`,
+          params,
         );
         deleted = Number.parseInt(deleteRes.rows[0]?.count ?? "0", 10);
       }
     } else {
       const softenRes = await client.query(
-        `UPDATE memories
-           SET importance = GREATEST(1, importance - 1)
-         WHERE last_accessed < NOW() - INTERVAL '30 days' AND importance > 1`,
+        `UPDATE memories AS m
+            SET importance = GREATEST(1, m.importance - 1)
+          WHERE ${PRUNE_VISIBLE} AND ${PRUNE_SOFTEN_ELIGIBLE}`,
+        params,
       );
       softened = softenRes.rowCount ?? 0;
 
       if (mode === "aggressive") {
         const deleteRes = await client.query(
-          `DELETE FROM memories
-           WHERE last_accessed < NOW() - INTERVAL '90 days' AND importance < 3`,
+          `DELETE FROM memories AS m
+            WHERE ${PRUNE_VISIBLE} AND ${PRUNE_STALE_FOR_DELETE}
+              AND m.importance < 3 AND ${PRUNE_NO_INCOMING_SUPERSESSION}`,
+          params,
         );
         deleted = deleteRes.rowCount ?? 0;
       }
@@ -281,6 +352,12 @@ export async function createApp(
 ): Promise<FastifyInstance> {
   const logLevel = process.env.DOLORES_LOG_LEVEL ?? "info";
   const app = Fastify({ logger: { level: logLevel } });
+  // The factory stays usable for DB-free health checks. Production startup
+  // performs the role/RLS preflight before exposing its data routes.
+  const poolErrors = new PoolErrorSink();
+  poolErrors.useLogger(app.log);
+  attachPoolErrorHandler(pool, "app", poolErrors);
+  if (adminPool) attachPoolErrorHandler(adminPool, "admin", poolErrors);
 
   // Optional final-stage reranker (EPIC H). Created once; NoOp unless
   // DOLORES_RERANKER selects a concrete local reranker. Stays off the LLM path.
@@ -603,7 +680,7 @@ export async function createApp(
         },
       });
     }
-    const { workspaceId, userId, dryRun = false } = parsed.data;
+    const { workspaceId, userId, dryRun = true } = parsed.data;
     const ctx: MemoryContext = { workspaceId, userId };
     try {
       const { softened, deleted } = await runPrune(pool, ctx, config.decayMode, dryRun);
@@ -692,48 +769,83 @@ export async function createApp(
 
 export async function startDaemon(config: DaemonRuntimeConfig): Promise<void> {
   const embedder = createEmbedder(config.embedder, config.embedModel);
-
-  const pool = new Pool({
-    connectionString: config.databaseUrl,
-    max: 10,
-    idleTimeoutMillis: 30_000,
-  });
-
-  // Superuser pool for /status global counts — reads DATABASE_URL which has
-  // BYPASSRLS / superuser privileges, unlike the app pool (dolores_app + RLS).
+  const poolErrors = new PoolErrorSink();
+  const pool = createDaemonPool(
+    {
+      connectionString: config.databaseUrl,
+      max: 10,
+      idleTimeoutMillis: 30_000,
+      connectionTimeoutMillis: 5_000,
+    },
+    "app",
+    poolErrors,
+  );
   const adminUrl = process.env.DATABASE_URL;
   const adminPool = adminUrl
-    ? new Pool({ connectionString: adminUrl, max: 3, idleTimeoutMillis: 30_000 })
+    ? createDaemonPool(
+        {
+          connectionString: adminUrl,
+          max: 3,
+          idleTimeoutMillis: 30_000,
+          connectionTimeoutMillis: 5_000,
+        },
+        "admin",
+        poolErrors,
+      )
     : undefined;
 
-  // Create app before embedder.ready() so app.log is available for startup
-  // messages. Route handlers only execute after app.listen() returns, by which
-  // time embedder.ready() has completed.
-  // Resolve the extraction provider once and share it with the app + worker.
-  const extractionProvider = config.extractionEnabled ? createLlmProviderFromEnv() : null;
-  const app = await createApp(pool, embedder, config, adminPool, extractionProvider);
+  let app: FastifyInstance | undefined;
+  let ingestWorker: IngestWorkerHandle | undefined;
+  const closeResource = async (resource: string, close: () => Promise<unknown>): Promise<void> => {
+    try {
+      await close();
+    } catch (err) {
+      // Cleanup failures must never replace the original startup failure.
+      const event = { resource, code: sanitizeErrorCode(err) };
+      if (app) app.log.warn(event, "startup cleanup failed");
+      else process.stderr.write(`${JSON.stringify({ ...event, msg: "startup cleanup failed" })}\n`);
+    }
+  };
 
-  app.log.info({ embedderId: embedder.id }, "loading embedder");
-  await embedder.ready();
-  app.log.info({ dim: embedder.dim }, "embedder ready");
-
-  // Durable ingest worker (EPIC J): drains the Postgres-native queue in the
-  // background. Started after the embedder is ready so jobs can be distilled.
-  const ingestWorker = await startIngestWorkers({
-    pool,
-    embedder,
-    extractionEnabled: config.extractionEnabled,
-    log: app.log,
-    provider: extractionProvider,
-  });
-
-  setupGracefulShutdown(app, pool, embedder, ingestWorker, adminPool);
-
-  await app.listen({ port: config.port, host: config.host });
-  app.log.info(
-    { host: config.host, port: config.port },
-    `listening on ${config.host}:${config.port}`,
-  );
+  try {
+    // Fail before model downloads, workers, or a listening socket if this role
+    // could bypass tenant policies. Catalog inspection is read-only.
+    await assertAppDatabaseIsolation(pool);
+    const extractionProvider = config.extractionEnabled ? createLlmProviderFromEnv() : null;
+    app = await createApp(pool, embedder, config, adminPool, extractionProvider);
+    poolErrors.useLogger(app.log);
+    app.log.info({ embedderId: embedder.id }, "loading embedder");
+    await embedder.ready();
+    app.log.info({ dim: embedder.dim }, "embedder ready");
+    ingestWorker = await startIngestWorkers({
+      pool,
+      embedder,
+      extractionEnabled: config.extractionEnabled,
+      log: app.log,
+      provider: extractionProvider,
+    });
+    await app.listen({ port: config.port, host: config.host });
+    setupGracefulShutdown(app, pool, embedder, ingestWorker, adminPool);
+    app.log.info(
+      { host: config.host, port: config.port },
+      `listening on ${config.host}:${config.port}`,
+    );
+  } catch (err) {
+    if (app) {
+      const failedApp = app;
+      await closeResource("http", () => failedApp.close());
+    }
+    if (ingestWorker) {
+      const failedWorker = ingestWorker;
+      await closeResource("ingest worker", () => failedWorker.stop());
+    }
+    await closeResource("embedder", async () =>
+      (embedder as Embedder & MaybeDisposable).dispose?.(),
+    );
+    await closeResource("app pool", () => pool.end());
+    if (adminPool) await closeResource("admin pool", () => adminPool.end());
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------

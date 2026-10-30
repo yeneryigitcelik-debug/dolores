@@ -1,4 +1,9 @@
-import { applyMigrations, enableAggressiveDecay, getPool } from "@dolores/db";
+import {
+  applyMigrations,
+  disableAggressiveDecay,
+  enableAggressiveDecay,
+  getPool,
+} from "@dolores/db";
 
 export async function runInit(opts: { noDocker: boolean }): Promise<void> {
   if (!process.env.DATABASE_URL) {
@@ -20,10 +25,22 @@ export async function runInit(opts: { noDocker: boolean }): Promise<void> {
     await applyMigrations(pool);
     console.log("✓ Şema hazır (pgvector, pg_cron, facts, memories, RLS)");
 
+    // Anything other than "aggressive" means conservative (existing behaviour).
     const decayMode = process.env.DOLORES_DECAY_MODE ?? "conservative";
     if (decayMode === "aggressive") {
       await enableAggressiveDecay(pool);
       console.log("✓ Agresif decay (cron DELETE) etkinleştirildi");
+    } else {
+      // Conservative mode must not keep a DELETE job left over from an earlier
+      // aggressive init. Only the "memory-decay" job is removed.
+      const removed = await disableAggressiveDecay(pool);
+      if (removed > 0) {
+        console.log(
+          `✓ Konservatif mod: önceki agresif decay cron işi (memory-decay) kaldırıldı (${removed})`,
+        );
+      } else {
+        console.log("✓ Konservatif mod: agresif decay cron işi zaten yok");
+      }
     }
 
     console.log("\ndolores başarıyla başlatıldı.");

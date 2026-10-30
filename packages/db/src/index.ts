@@ -6,11 +6,14 @@
  *   applyMigrations(pool)                  → idempotent schema bootstrap
  *   withTenant(pool, ctx, fn)              → RLS-scoped transaction helper
  *   enableAggressiveDecay(pool)            → opt-in: schedule DELETE cron job
+ *   disableAggressiveDecay(pool)           → remove the DELETE cron job if present
+ *   attachPoolErrorListener(pool)          → sanitized idle-client error diagnostics
  */
 
 import { Pool } from "pg";
 import type { PoolClient } from "pg";
 import {
+  AGGRESSIVE_DECAY_JOB_NAME,
   AGGRESSIVE_DECAY_SQL,
   INIT_SQL,
   resolveVectorIndexKind,
@@ -18,6 +21,71 @@ import {
 } from "./migration.js";
 
 export type { Pool, PoolClient };
+export { AGGRESSIVE_DECAY_JOB_NAME };
+
+// ---------------------------------------------------------------------------
+// Diagnostics (sanitized — never logs URLs, queries, parameters or messages)
+// ---------------------------------------------------------------------------
+
+export type DbDiagnosticLogger = (message: string) => void;
+
+const defaultErrorLogger: DbDiagnosticLogger = (message) => {
+  console.error(message);
+};
+
+const SAFE_ERROR_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const SAFE_ERROR_CODE = /^[A-Za-z0-9_]{1,32}$/;
+
+/**
+ * Reduces an error to its class name + SQLSTATE / errno code. The free-form
+ * message is deliberately dropped: pg messages can embed connection strings,
+ * hostnames, query text or row values.
+ */
+export function describeDbError(err: unknown): string {
+  if (typeof err !== "object" || err === null) return "non-error value";
+  const nameRaw: unknown = (err as { name?: unknown }).name;
+  const codeRaw: unknown = (err as { code?: unknown }).code;
+  const name = typeof nameRaw === "string" && SAFE_ERROR_NAME.test(nameRaw) ? nameRaw : "Error";
+  const code = typeof codeRaw === "string" && SAFE_ERROR_CODE.test(codeRaw) ? codeRaw : undefined;
+  return code ? `${name} code=${code}` : name;
+}
+
+const guardedPools = new WeakSet<Pool>();
+
+/**
+ * pg.Pool emits 'error' when an IDLE client dies (server restart, network drop).
+ * Without a listener Node treats it as an unhandled 'error' event and crashes the
+ * process. Attaches exactly one sanitized listener per pool (idempotent).
+ */
+export function attachPoolErrorListener(
+  pool: Pool,
+  log: DbDiagnosticLogger = defaultErrorLogger,
+): void {
+  if (guardedPools.has(pool)) return;
+  guardedPools.add(pool);
+  pool.on("error", (err: Error) => {
+    log(
+      `[dolores/db] idle pool client error (${describeDbError(err)}); the pool discarded the client`,
+    );
+  });
+}
+
+/**
+ * Best-effort ROLLBACK. Returns false when ROLLBACK itself failed — the caller
+ * must then discard the connection and rethrow its ORIGINAL error (a failed
+ * ROLLBACK must never mask the real cause).
+ */
+async function rollbackBestEffort(client: PoolClient): Promise<boolean> {
+  try {
+    await client.query("ROLLBACK");
+    return true;
+  } catch (rollbackErr) {
+    console.warn(
+      `[dolores/db] ROLLBACK failed (${describeDbError(rollbackErr)}); discarding connection, original error is rethrown`,
+    );
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Singleton pool
@@ -28,12 +96,16 @@ let _pool: Pool | null = null;
 /**
  * Returns the process-wide singleton pg.Pool.
  * Reads DATABASE_URL from the environment on first call and throws if missing.
+ * The pool gets a sanitized idle-error listener so a dropped idle connection
+ * cannot crash the process.
  */
 export function getPool(): Pool {
   if (_pool) return _pool;
   const url = process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL environment variable is not set");
-  _pool = new Pool({ connectionString: url });
+  const pool = new Pool({ connectionString: url });
+  attachPoolErrorListener(pool);
+  _pool = pool;
   return _pool;
 }
 
@@ -46,7 +118,8 @@ export function getPool(): Pool {
  * Idempotent — safe to call on every startup (`dolores init` calls this).
  *
  * Wrapped in a single transaction: if any statement fails the entire migration
- * is rolled back, preventing partial schema state.
+ * is rolled back, preventing partial schema state. A failing ROLLBACK never
+ * masks the original error (the connection is discarded instead).
  *
  * Reads DOLORES_APP_PASSWORD from the environment to set the dolores_app role
  * password via a safely-escaped ALTER ROLE statement (no SQL injection risk).
@@ -59,6 +132,7 @@ export function getPool(): Pool {
  *    ivfflat [default] or hnsw via DOLORES_VECTOR_INDEX)
  *  - HOT update optimization (fillfactor=80 on memories)
  *  - RLS policies with both USING and WITH CHECK clauses
+ *  - CONNECT grant on current_database() (alternate DB names supported)
  *  - SECURITY DEFINER decay functions (bypass FORCE RLS for pg_cron jobs)
  *  - Conservative pg_cron job ("memory-soften" via dolores_soften_memories())
  */
@@ -67,6 +141,7 @@ export async function applyMigrations(pool: Pool): Promise<void> {
     console.warn("[dolores/db] DOLORES_APP_PASSWORD is not set — using insecure default password");
   }
   const client = await pool.connect();
+  let discard = false;
   try {
     await client.query("BEGIN");
     await client.query(INIT_SQL);
@@ -81,16 +156,17 @@ export async function applyMigrations(pool: Pool): Promise<void> {
     await client.query(`ALTER ROLE dolores_app WITH PASSWORD ${pwd}`);
     await client.query("COMMIT");
   } catch (err) {
-    await client.query("ROLLBACK");
+    discard = !(await rollbackBestEffort(client));
     throw err;
   } finally {
-    client.release();
+    client.release(discard);
   }
 }
 
 /**
  * Schedules the aggressive decay cron job (DELETE low-importance old memories).
- * Only call when DOLORES_DECAY_MODE=aggressive.
+ * Only call when DOLORES_DECAY_MODE=aggressive. cron.schedule() upserts by job
+ * name, so calling this repeatedly keeps exactly one "memory-decay" job.
  */
 export async function enableAggressiveDecay(pool: Pool): Promise<void> {
   const client = await pool.connect();
@@ -98,6 +174,45 @@ export async function enableAggressiveDecay(pool: Pool): Promise<void> {
     await client.query(AGGRESSIVE_DECAY_SQL);
   } finally {
     client.release();
+  }
+}
+
+/**
+ * Removes the aggressive decay cron job ("memory-decay") from the current
+ * database if it exists. Touches ONLY jobs with that exact name — memory-soften
+ * and ingest-jobs-purge are left untouched. Never errors when no such job
+ * exists (cron.unschedule is only called for rows actually found).
+ *
+ * @returns number of jobs removed (0 when aggressive decay was not scheduled)
+ */
+export async function disableAggressiveDecay(pool: Pool): Promise<number> {
+  const client = await pool.connect();
+  let discard = false;
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query<{ jobid: string }>(
+      `SELECT jobid::text AS jobid
+         FROM cron.job
+        WHERE jobname = $1
+          AND database = current_database()
+        ORDER BY jobid`,
+      [AGGRESSIVE_DECAY_JOB_NAME],
+    );
+    let removed = 0;
+    for (const row of rows) {
+      const res = await client.query<{ removed: boolean }>(
+        "SELECT cron.unschedule($1::bigint) AS removed",
+        [row.jobid],
+      );
+      if (res.rows[0]?.removed === true) removed += 1;
+    }
+    await client.query("COMMIT");
+    return removed;
+  } catch (err) {
+    discard = !(await rollbackBestEffort(client));
+    throw err;
+  } finally {
+    client.release(discard);
   }
 }
 
@@ -128,6 +243,9 @@ export interface TenantContext {
  *   • user_id IS NOT NULL rows are visible only when dolores.user_id matches.
  *   • If dolores.workspace_id is not set (outside withTenant), NO rows pass.
  *
+ * Error handling: ROLLBACK is best-effort. If it fails, the connection is
+ * destroyed (not returned to the pool) and the ORIGINAL error is rethrown.
+ *
  * Usage:
  *   const hits = await withTenant(pool, { workspaceId, userId }, (c) =>
  *     c.query('SELECT * FROM memories WHERE scope = $1', ['personal'])
@@ -144,6 +262,7 @@ export async function withTenant<T>(
   fn: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
   const client = await pool.connect();
+  let discard = false;
   try {
     await client.query("BEGIN");
     // SET LOCAL is transaction-scoped — only visible within this transaction.
@@ -154,9 +273,9 @@ export async function withTenant<T>(
     await client.query("COMMIT");
     return result;
   } catch (err) {
-    await client.query("ROLLBACK");
+    discard = !(await rollbackBestEffort(client));
     throw err;
   } finally {
-    client.release();
+    client.release(discard);
   }
 }

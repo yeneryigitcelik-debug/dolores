@@ -224,7 +224,13 @@ BEGIN
   END IF;
 END;
 $$;
-GRANT CONNECT ON DATABASE dolores TO dolores_app;
+-- CONNECT is granted on whatever database we are migrating (not a hard-coded
+-- 'dolores'), so alternate database names work. format('%I') quotes the identifier.
+DO $$
+BEGIN
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO dolores_app', current_database());
+END;
+$$;
 GRANT USAGE ON SCHEMA public TO dolores_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE memories, facts, ingest_jobs TO dolores_app;
 
@@ -254,9 +260,16 @@ CREATE OR REPLACE FUNCTION dolores_decay_memories()
   SET search_path = public
 AS $$
 BEGIN
-  DELETE FROM memories
-   WHERE importance < 3
-     AND last_accessed < now() - INTERVAL '90 days';
+  -- Never delete a memory that another row points at via superseded_by: the
+  -- ON DELETE SET NULL FK would otherwise silently turn the predecessor back
+  -- into an "active" memory. Unreferenced expired rows (leaves) still go.
+  DELETE FROM memories m
+   WHERE m.importance < 3
+     AND m.last_accessed < now() - INTERVAL '90 days'
+     AND NOT EXISTS (
+       SELECT 1 FROM memories predecessor
+        WHERE predecessor.superseded_by = m.id
+     );
 END;
 $$;
 
@@ -359,6 +372,9 @@ SELECT cron.schedule(
   'SELECT dolores_purge_ingest_jobs()'
 );
 `;
+
+/** pg_cron job name used by the opt-in aggressive (DELETE) decay. */
+export const AGGRESSIVE_DECAY_JOB_NAME = "memory-decay";
 
 /** Opt-in aggressive decay — schedule only when DOLORES_DECAY_MODE=aggressive. */
 export const AGGRESSIVE_DECAY_SQL = /* sql */ `

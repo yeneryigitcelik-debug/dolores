@@ -275,6 +275,7 @@ export interface IngestStatusResponse {
 }
 
 export interface PruneRequest extends MemoryContext {
+  /** Omitted means preview (true); direct HTTP consumers must explicitly opt in to apply. */
   dryRun?: boolean;
 }
 export interface PruneResponse {

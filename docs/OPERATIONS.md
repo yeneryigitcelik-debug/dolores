@@ -66,6 +66,12 @@ dolores uses `pg_cron` to run a nightly decay job that softens the importance of
 
 Aggressive delete is explicitly opt-in to prevent accidental data loss. Set it only when running dolores as a short-session scratchpad rather than a long-term memory store.
 
+After changing `DOLORES_DECAY_MODE`, re-run `dolores init --no-docker`. Conservative initialization unschedules the existing `memory-decay` job for the current database only; it preserves the softening and queue-maintenance jobs. Changing the daemon environment alone does not remove an already scheduled database job.
+
+Both aggressive cron cleanup and manual pruning retain a row referenced by another memory's `superseded_by`. This prevents deleting a terminal version from clearing that link and making older history appear active again. Consequently some old version chains remain intentionally retained.
+
+`POST /prune` defaults to `dryRun: true` when omitted. A preview includes rows whose importance would fall from 3 to 2 before the aggressive deletion step. Set `dryRun: false` explicitly to apply; CLI `prune` previews by default and requires `--confirm` to apply. Pruning also includes explicit workspace/user predicates in addition to RLS.
+
 ---
 
 ## Memory Evolution (temporal history)
@@ -86,7 +92,7 @@ curl -s localhost:4505/recall -d '{"workspaceId":"…","query":"hosting provider
 curl -s localhost:4505/recall -d '{"workspaceId":"…","query":"hosting provider","asOf":"2026-05-01"}'
 ```
 
-Default recall and the static `/context` blob always show the **active** set only; superseded rows never leak into normal retrieval. The required columns are added automatically by `applyMigrations()` (idempotent) — no manual migration step. If you run `versioned`, monitor table growth and rely on `prune` / decay for cleanup of old superseded rows.
+Default recall and the static `/context` blob always show the **active** set only; superseded rows never leak into normal retrieval. The required columns are added automatically by `applyMigrations()` (idempotent) — no manual migration step. If you run `versioned`, monitor table growth: `prune` / decay remove eligible unreferenced rows but retain version-history targets.
 
 ---
 
@@ -180,6 +186,8 @@ Then set `DOLORES_VECTOR_INDEX=hnsw` so recall uses `hnsw.ef_search`. Benchmark 
 
 ## Daemon Environment Variables
 
+Startup inspects the runtime connection before loading the embedder, starting workers, or listening. The role must be neither superuser nor `BYPASSRLS`; `facts`, `memories`, and `ingest_jobs` must have RLS enabled and forced. Run `dolores init --no-docker` with the admin URL to install the schema, and configure the app URL separately. The admin connection may remain available for queue maintenance; it is never the tenant operation pool. Pool connection errors are handled without logging connection URLs, and a failed startup drains acquired resources before exiting.
+
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | — | Postgres superuser URL (used by `dolores init`) |
@@ -188,7 +196,7 @@ Then set `DOLORES_VECTOR_INDEX=hnsw` so recall uses `hnsw.ef_search`. Benchmark 
 | `DOLORES_DAEMON_PORT` | `4505` | Port the daemon listens on (localhost only) |
 | `DOLORES_LOG_LEVEL` | `info` | Fastify log level (`trace` / `debug` / `info` / `warn` / `error`) |
 | `DOLORES_EMBED_MODEL` | `bge-small-en-v1.5` | fastembed model name (`bge-small-en-v1.5` = 384d CPU) |
-| `DOLORES_MODEL_CACHE` | `~/.dolores-models` | Where fastembed stores downloaded model weights |
+| `DOLORES_MODEL_CACHE` | `.dolores-models` (working directory) | Where fastembed stores downloaded model weights |
 | `DOLORES_VECTOR_INDEX` | `ivfflat` | Vector index access method: `ivfflat` (default) or `hnsw` (pgvector ≥0.5). See Vector Index below |
 | `DOLORES_IVFFLAT_PROBES` | `10` | `ivfflat.probes` for pgvector ANN searches (higher = more accurate, slower) |
 | `DOLORES_HNSW_EF_SEARCH` | `40` | `hnsw.ef_search` when `DOLORES_VECTOR_INDEX=hnsw` (higher = more accurate, slower) |
