@@ -52,18 +52,22 @@ export async function buildContext(
 
   if (trimmedQuery) {
     const facts = await withTenant(pool, ctx, fetchFacts);
+    // Aday havuzu salt-okunur çekilir (touch:false): bütçe kırpması adayların
+    // çoğunu atar; yalnızca bağlama gerçekten giren satırlar aşağıda güncellenir.
     const { hits } = await recall(
       pool,
       ctx,
       embedder ?? new NoOpEmbedder(),
       { query: trimmedQuery, limit: MEMORY_CANDIDATES },
       reranker,
+      { touch: false },
     );
-    const memories: RenderMemory[] = hits.map((h) => ({
-      content: h.content,
-      importance: h.importance,
-    }));
-    return renderContext(facts, memories, maxTokens);
+    const { built, memoryCount } = packContext(facts, hits, maxTokens);
+    const selectedIds = hits.slice(0, memoryCount).map((h) => h.id);
+    if (selectedIds.length > 0) {
+      await withTenant(pool, ctx, (client) => touchMemories(client, ctx.workspaceId, selectedIds));
+    }
+    return built;
   }
 
   return withTenant(pool, ctx, async (client) => {
@@ -76,8 +80,31 @@ export async function buildContext(
         LIMIT $1`,
       [MEMORY_CANDIDATES],
     );
-    return renderContext(facts, memories.rows, maxTokens);
+    const { built, memoryCount } = packContext(facts, memories.rows, maxTokens);
+    // Aynı tenant transaction'ı içinde: yalnızca render edilen satırlar güncellenir.
+    const selectedIds = memories.rows.slice(0, memoryCount).map((m) => m.id);
+    if (selectedIds.length > 0) {
+      await touchMemories(client, ctx.workspaceId, selectedIds);
+    }
+    return built;
   });
+}
+
+/**
+ * Bağlama gerçekten giren memory'lerin `last_accessed` değerini günceller.
+ * Parametreler bağlı; RLS'e ek olarak açık workspace filtresi ve yalnızca aktif
+ * (süperseded olmamış) satırlar.
+ */
+async function touchMemories(
+  client: PoolClient,
+  workspaceId: string,
+  ids: readonly string[],
+): Promise<void> {
+  await client.query(
+    `UPDATE memories SET last_accessed = now()
+      WHERE workspace_id = $1 AND id = ANY($2::uuid[]) AND superseded_by IS NULL`,
+    [workspaceId, [...ids]],
+  );
 }
 
 /**
@@ -103,12 +130,26 @@ export function renderContext(
   memories: RenderMemory[],
   maxTokens: number,
 ): BuiltContext {
+  return packContext(facts, memories, maxTokens).built;
+}
+
+/**
+ * Özel defter tutma: renderContext ile birebir aynı çıktıyı üretir ve ek olarak
+ * kaç memory'nin (önek olarak) bağlama girdiğini döndürür. Paketleme önek-açgözlü
+ * olduğu için seçilen memory'ler tam olarak ilk `memoryCount` öğedir.
+ */
+function packContext(
+  facts: Fact[],
+  memories: readonly RenderMemory[],
+  maxTokens: number,
+): { built: BuiltContext; memoryCount: number } {
   const maxChars = budgetToMaxChars(maxTokens);
   const lines: string[] = [];
   let used = 0;
 
-  const pack = <T>(header: string, items: readonly T[], render: (item: T) => string): void => {
+  const pack = <T>(header: string, items: readonly T[], render: (item: T) => string): number => {
     let headerAdded = false;
+    let count = 0;
     for (const item of items) {
       const line = render(item);
       const sep = lines.length > 0 ? 1 : 0;
@@ -120,12 +161,14 @@ export function renderContext(
       }
       lines.push(line);
       used += extra;
+      count++;
     }
+    return count;
   };
 
   pack("# Facts", facts, (f) => `- [${f.category}] ${f.key}: ${f.value}`);
-  pack("# Memories", memories, (m) => `- (${m.importance}) ${m.content}`);
+  const memoryCount = pack("# Memories", memories, (m) => `- (${m.importance}) ${m.content}`);
 
   const text = lines.join("\n");
-  return { text, tokenEstimate: tokenEstimate(text) };
+  return { built: { text, tokenEstimate: tokenEstimate(text) }, memoryCount };
 }
