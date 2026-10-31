@@ -6,6 +6,7 @@ import type {
   RememberInput,
   RememberResponse,
 } from "../types.js";
+import { resolveWriteOwner } from "./scope.js";
 import { clampImportance, requireRow, toVectorLiteral } from "./sql.js";
 import { withTenant } from "./tenant.js";
 
@@ -44,6 +45,8 @@ export async function remember(
 ): Promise<RememberResponse> {
   const content = input.content.trim();
   if (!content) throw new Error("remember: content must be non-empty");
+  // Validate ownership BEFORE embedding/DB so an invalid personal write never leaks.
+  resolveWriteOwner(ctx, input.scope);
 
   let vector: number[] | null = null;
   if (embedder.dim > 0) {
@@ -76,6 +79,7 @@ export async function _rememberPreembedded(
 ): Promise<RememberResponse> {
   const content = input.content.trim();
   if (!content) throw new Error("remember: content must be non-empty");
+  resolveWriteOwner(ctx, input.scope);
   return writeMemory(pool, ctx, input, preVector);
 }
 
@@ -96,7 +100,9 @@ async function writeMemory(
   vector: number[] | null,
 ): Promise<RememberResponse> {
   const content = input.content.trim();
-  const scope = input.scope ?? "personal";
+  // Defensive: re-resolve the physical owner here too.
+  const owner = resolveWriteOwner(ctx, input.scope);
+  const scope = owner.scope;
   const importance = clampImportance(input.importance);
   const source = input.source ?? null;
 
@@ -105,8 +111,8 @@ async function writeMemory(
       // Serialize concurrent dedup for the same tenant+scope.
       // pg_advisory_xact_lock is released automatically at COMMIT/ROLLBACK.
       await client.query(
-        "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2, '') || ':' || $3))",
-        [ctx.workspaceId, ctx.userId ?? null, scope],
+        "SELECT pg_advisory_xact_lock(hashtext($1 || ':' || coalesce($2::text, '') || ':' || $3))",
+        [ctx.workspaceId, owner.userId, scope],
       );
 
       const literal = toVectorLiteral(vector);
@@ -119,9 +125,10 @@ async function writeMemory(
            FROM memories
           WHERE embedding IS NOT NULL AND scope = $2 AND workspace_id = $3
             AND superseded_by IS NULL
+            AND user_id IS NOT DISTINCT FROM $4::uuid
           ORDER BY embedding <=> $1::vector
           LIMIT 1`,
-        [literal, scope, ctx.workspaceId],
+        [literal, scope, ctx.workspaceId, owner.userId],
       );
 
       const top = similar.rows[0];
@@ -135,7 +142,7 @@ async function writeMemory(
             `INSERT INTO memories (workspace_id, user_id, scope, content, importance, source, embedding)
              VALUES ($1, $2, $3, $4, $5, $6, $7::vector)
              RETURNING id`,
-            [ctx.workspaceId, ctx.userId ?? null, scope, content, kept, source, literal],
+            [ctx.workspaceId, owner.userId, scope, content, kept, source, literal],
           );
           const newId = requireRow(inserted.rows, "remember versioned insert").id;
           await client.query(
@@ -164,7 +171,7 @@ async function writeMemory(
         `INSERT INTO memories (workspace_id, user_id, scope, content, importance, source, embedding)
          VALUES ($1, $2, $3, $4, $5, $6, $7::vector)
          RETURNING id`,
-        [ctx.workspaceId, ctx.userId ?? null, scope, content, importance, source, literal],
+        [ctx.workspaceId, owner.userId, scope, content, importance, source, literal],
       );
       return { id: requireRow(inserted.rows, "remember insert").id, deduped: false };
     }
@@ -174,7 +181,7 @@ async function writeMemory(
       `INSERT INTO memories (workspace_id, user_id, scope, content, importance, source, embedding)
        VALUES ($1, $2, $3, $4, $5, $6, NULL)
        RETURNING id`,
-      [ctx.workspaceId, ctx.userId ?? null, scope, content, importance, source],
+      [ctx.workspaceId, owner.userId, scope, content, importance, source],
     );
     return { id: requireRow(inserted.rows, "remember insert").id, deduped: false };
   });

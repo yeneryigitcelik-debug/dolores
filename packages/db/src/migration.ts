@@ -224,7 +224,13 @@ BEGIN
   END IF;
 END;
 $$;
-GRANT CONNECT ON DATABASE dolores TO dolores_app;
+-- CONNECT is granted on whatever database we are migrating (not a hard-coded
+-- 'dolores'), so alternate database names work. format('%I') quotes the identifier.
+DO $$
+BEGIN
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO dolores_app', current_database());
+END;
+$$;
 GRANT USAGE ON SCHEMA public TO dolores_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE memories, facts, ingest_jobs TO dolores_app;
 
@@ -254,9 +260,16 @@ CREATE OR REPLACE FUNCTION dolores_decay_memories()
   SET search_path = public
 AS $$
 BEGIN
-  DELETE FROM memories
-   WHERE importance < 3
-     AND last_accessed < now() - INTERVAL '90 days';
+  -- Never delete a memory that another row points at via superseded_by: the
+  -- ON DELETE SET NULL FK would otherwise silently turn the predecessor back
+  -- into an "active" memory. Unreferenced expired rows (leaves) still go.
+  DELETE FROM memories m
+   WHERE m.importance < 3
+     AND m.last_accessed < now() - INTERVAL '90 days'
+     AND NOT EXISTS (
+       SELECT 1 FROM memories predecessor
+        WHERE predecessor.superseded_by = m.id
+     );
 END;
 $$;
 
@@ -296,19 +309,42 @@ BEGIN
 END;
 $$;
 
--- Crash recovery: reset jobs stuck in 'running' (a previous daemon died mid-job)
--- back to 'pending'. Called once on worker startup. Returns the count reclaimed.
+-- Lease-based crash recovery. A running job's updated_at is its lease; workers
+-- heartbeat it. Only rows whose lease EXPIRED (older than lease_ms, clamped to
+-- >= 60s) are reset to 'pending' — live jobs of other daemons are never touched.
+-- Called on worker startup and periodically. Returns the count reclaimed.
+CREATE INDEX IF NOT EXISTS idx_ingest_jobs_running_lease
+  ON ingest_jobs (updated_at) WHERE status = 'running';
+
+CREATE OR REPLACE FUNCTION dolores_reclaim_expired_ingest_jobs(lease_ms INT)
+  RETURNS INT
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path = public
+AS $$
+DECLARE
+  n INT;
+  eff INT := GREATEST(COALESCE(lease_ms, 300000), 60000);
+BEGIN
+  UPDATE ingest_jobs
+     SET status = 'pending', updated_at = now()
+   WHERE status = 'running'
+     AND updated_at < now() - (eff * INTERVAL '1 millisecond');
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END;
+$$;
+
+-- Legacy zero-arg entry point kept for compatibility, now with SAFE 5-minute
+-- expired-lease semantics (it used to reset EVERY running job).
 CREATE OR REPLACE FUNCTION dolores_reclaim_ingest_jobs()
   RETURNS INT
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path = public
 AS $$
-DECLARE n INT;
 BEGIN
-  UPDATE ingest_jobs SET status = 'pending', updated_at = now() WHERE status = 'running';
-  GET DIAGNOSTICS n = ROW_COUNT;
-  RETURN n;
+  RETURN dolores_reclaim_expired_ingest_jobs(300000);
 END;
 $$;
 
@@ -327,6 +363,8 @@ $$;
 
 GRANT EXECUTE ON FUNCTION dolores_claim_ingest_job() TO dolores_app;
 GRANT EXECUTE ON FUNCTION dolores_reclaim_ingest_jobs() TO dolores_app;
+REVOKE ALL ON FUNCTION dolores_reclaim_expired_ingest_jobs(INT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION dolores_reclaim_expired_ingest_jobs(INT) TO dolores_app;
 
 SELECT cron.schedule(
   'ingest-jobs-purge',
@@ -334,6 +372,9 @@ SELECT cron.schedule(
   'SELECT dolores_purge_ingest_jobs()'
 );
 `;
+
+/** pg_cron job name used by the opt-in aggressive (DELETE) decay. */
+export const AGGRESSIVE_DECAY_JOB_NAME = "memory-decay";
 
 /** Opt-in aggressive decay — schedule only when DOLORES_DECAY_MODE=aggressive. */
 export const AGGRESSIVE_DECAY_SQL = /* sql */ `

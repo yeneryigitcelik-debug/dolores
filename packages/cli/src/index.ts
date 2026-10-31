@@ -2,7 +2,7 @@
 /**
  * @dolores/cli — commander-based thin client for the dolores daemon.
  *
- * Commands: init · remember · recall · context · ingest · facts · prune · status
+ * Commands: init · remember · recall · context · ingest · ingest-status · facts · prune · status
  *
  * Identity env:
  *   DOLORES_WORKSPACE_ID  — default 00000000-0000-0000-0000-000000000001
@@ -16,6 +16,7 @@ import { Command } from "commander";
 import { runConsolidate } from "./commands/consolidate.js";
 import { runContext } from "./commands/context.js";
 import { runFacts } from "./commands/facts.js";
+import { runIngestStatus } from "./commands/ingest-status.js";
 import { runIngest } from "./commands/ingest.js";
 import { runInit } from "./commands/init.js";
 import { runPrune } from "./commands/prune.js";
@@ -44,7 +45,7 @@ program
 program
   .command("remember <content>")
   .description("Yeni bir bellek kaydet")
-  .option("--scope <scope>", "personal veya workspace (varsayılan: personal)", "personal")
+  .option("--scope <scope>", "personal veya workspace (varsayılan: kullanıcı varsa personal)")
   .option(
     "--importance <n>",
     "1..10 önem skoru (varsayılan: 5)",
@@ -102,6 +103,17 @@ program
   )
   .action(async (file?: string) => {
     await runIngest(file);
+  });
+
+// ---------------------------------------------------------------------------
+// ingest-status — POST /ingest/status  (read-only job inquiry)
+// ---------------------------------------------------------------------------
+program
+  .command("ingest-status <jobId>")
+  .description("Bir ingest işinin durumunu göster (pending | running | done | failed)")
+  .option("--json", "sonucu tek bir JSON nesnesi olarak yaz")
+  .action(async (jobId: string, opts: { json?: boolean }) => {
+    await runIngestStatus(jobId, opts);
   });
 
 // ---------------------------------------------------------------------------

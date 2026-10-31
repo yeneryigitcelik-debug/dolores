@@ -81,6 +81,16 @@ function resolveFusionWeights(): FusionWeights {
 }
 
 /**
+ * Alt seviye recall seçenekleri (geriye uyumlu; daemon/MCP girdisine açılmaz).
+ * `touch` (varsayılan true): dönen satırların `last_accessed` değerini güncelle.
+ * buildContext aday havuzunu `touch: false` ile çeker ve yalnızca gerçekten
+ * bağlama giren satırları kendisi günceller.
+ */
+export interface RecallOptions {
+  touch?: boolean;
+}
+
+/**
  * Hybrid recall: pgvector cosine + Postgres full-text, fused with RRF.
  *
  * SAF SQL + vector — no LLM on this path. With the noop embedder (dim 0) only
@@ -93,6 +103,7 @@ export async function recall(
   embedder: Embedder,
   q: RecallQuery,
   reranker: Reranker = new NoOpReranker(),
+  options: RecallOptions = {},
 ): Promise<RecallResult> {
   const query = q.query.trim();
   const limit = q.limit && q.limit > 0 ? q.limit : DEFAULT_LIMIT;
@@ -190,7 +201,8 @@ export async function recall(
     // active recall. A point-in-time (asOf) or includeSuperseded query is
     // read-only introspection; bumping last_accessed there would pollute the
     // live recency signal that decay/ranking rely on.
-    if (!q.asOf && !q.includeSuperseded) {
+    // `touch: false` → çağıran (ör. buildContext) güncellemeyi kendisi yapar.
+    if (options.touch !== false && !q.asOf && !q.includeSuperseded) {
       await client.query("UPDATE memories SET last_accessed = now() WHERE id = ANY($1::uuid[])", [
         ranked.map((f) => f.id),
       ]);

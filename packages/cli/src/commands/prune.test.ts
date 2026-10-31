@@ -4,6 +4,7 @@ import { runPrune } from "./prune.js";
 
 // Config mock: tüm export'ları kapsıyor — daemonBaseUrl dahil
 vi.mock("../config.js", () => ({
+  DEFAULT_REQUEST_TIMEOUT_MS: 60_000,
   getConfig: () => ({
     workspaceId: "00000000-0000-0000-0000-000000000001",
     daemonHost: "127.0.0.1",
@@ -21,10 +22,7 @@ const DRY_RES: PruneResponse = { deleted: 5, softened: 3, dryRun: true };
 const REAL_RES: PruneResponse = { deleted: 5, softened: 3, dryRun: false };
 
 function makeFetch(payload: PruneResponse) {
-  return vi.fn().mockResolvedValue({
-    ok: true,
-    json: () => Promise.resolve(payload),
-  });
+  return vi.fn().mockResolvedValue(new Response(JSON.stringify(payload)));
 }
 
 afterEach(() => {
@@ -85,10 +83,7 @@ describe("runPrune — confirm gate", () => {
   it("exits with code 1 when daemon returns invalid response shape", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({ unexpected: "shape" }),
-      }),
+      vi.fn().mockResolvedValue(new Response(JSON.stringify({ unexpected: "shape" }))),
     );
     vi.spyOn(console, "error").mockImplementation(() => {});
     const exitSpy = vi.spyOn(process, "exit").mockImplementation((_code) => {

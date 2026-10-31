@@ -2,7 +2,7 @@
 
 # dolores
 
-**Yapay zekâ agent'ları için, yalnızca *önemli* olanı hatırlayan bellek — kendi Postgres'in, kendi verin, token başına sıfır maliyet.**
+**Yapay zekâ agent'ları için, yalnızca *önemli* olanı hatırlayan bellek — kendi Postgres'in, kendi verin, varsayılan yerel embedding.**
 
 [![CI](https://github.com/yeneryigitcelik-debug/dolores/actions/workflows/ci.yml/badge.svg)](https://github.com/yeneryigitcelik-debug/dolores/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -27,7 +27,7 @@ Agent belleğine yaygın yaklaşım — her şeyi bir Markdown dosyasına yazıp
 
 **dolores bilgiyi Postgres'te saklar ve yalnızca o anki mesaja *alakalı* olanı getirir (~600 token).** İster 200 ister 2.000 anınız olsun, bağlama yalnızca en alakalı birkaçı girer. **Kazanç, bellek büyüdükçe artar.**
 
-Ödediğiniz tek şey zaten sahip olduğunuz LLM aboneliğidir (Claude Pro/Max vb.). Embedding'ler yerel ve ücretsiz çalışır. Veriniz altyapınızdan hiç çıkmaz.
+Varsayılan yerel embedder CPU üzerinde, token başına API ücreti olmadan çalışır. İsteğe bağlı OpenAI embedding ile Anthropic/OpenAI extraction ve consolidation seçilen içeriği bu sağlayıcılara gönderir ve API ücreti doğurur; sohbet aboneliği API kullanımını içermez. Yerel model ağırlıkları ilk kullanımda indirilir.
 
 ## Benchmark'lar
 
@@ -60,10 +60,10 @@ Hibrit retrieval, **yalnızca full-text'ten 2,6× daha iyidir**. Full-text bireb
 - 🧠 **İki tür bellek** — yapısal **facts** (deterministik anahtar/değer, kesin SQL) ve anlamsal **memories** (serbest metin, vektör benzerliği).
 - 🔍 **Hibrit retrieval** — pgvector cosine **+** Postgres full-text, Reciprocal Rank Fusion ile birleştirilir. "Lite mode"da saf full-text'e düşer.
 - 🆓 **Varsayılan ücretsiz yerel embedding** — `fastembed` (bge-small, 384d) CPU'da. OpenAI ile değiştirilebilir veya `noop` embedder ile embedding'siz çalışır.
-- 🏢 **Row-Level Security ile çok kiracılı** — personal + workspace kapsamları, veritabanı seviyesinde izole. Takımlar için güvenli.
+- 🏢 **Row-Level Security ile çok kiracılı** — personal + workspace kapsamları, sağlanan kiracı bağlamı için veritabanında uygulanır. Kimlik sınırı aşağıda açıklanır.
 - 🔌 **Birinci sınıf MCP** — `remember` / `recall` tool'larını sunar; böylece Claude Code & Cursor bağlamı *kendileri* kaydedip geri çağırır.
 - 🧹 **Kendi kendini bakımlı** — `pg_cron` eski anıları veritabanı içinde çürütür. Varsayılan muhafazakâr (yumuşatır, asla silmez); agresif silme opt-in.
-- 🗑️ **Ham transkript yok** — yalnızca damıtılmış fact ve memory saklanır. Çöp girer çöp çıkar — bu yüzden çöp saklamayız.
+- 🗑️ **Ham transkript yok** — uzun süreli depoda damıtılmış fact ve memory saklanır. Async ingest ham girdiyi iş bitene veya deneme hakkı tükenene kadar Postgres kuyruğunda geçici tutar.
 - 🐘 **Tek gerçek kaynağı** — Postgres. CLI, MCP ve zamanlanmış işler aynı veritabanını okur; çakışmaları ACID halleder.
 
 ## Mimari
@@ -88,7 +88,7 @@ Veya kaynaktan çalıştırın (aşağıya bakın).
 
 ## Hızlı Başlangıç
 
-**Gereksinimler:** Node ≥ 20, pnpm, Docker.
+**Gereksinimler:** Node ≥ 20.6 (veya Node 22), pnpm, Docker.
 
 ```bash
 git clone https://github.com/yeneryigitcelik-debug/dolores.git
@@ -98,11 +98,15 @@ cp .env.example .env          # isterseniz düzenleyin
 
 pnpm db:up                    # Postgres + pgvector + pg_cron
 pnpm build
-dolores init                  # extension'lar, şema, RLS, decay job
+node --env-file=.env packages/cli/dist/index.js init --no-docker
 
-dolores remember "Production Hetzner'da Coolify ile deploy ediliyor." --scope workspace
-dolores recall  "production nerede barınıyor?"
-dolores context               # system prompt'a basılacak minimal-token bellek bloğu
+# Aynı dizinde ikinci terminalde daemon'ı başlat:
+node --env-file=.env packages/daemon/dist/index.js
+
+# Daemon hazır olunca ilk terminalde çalıştır:
+node --env-file=.env packages/cli/dist/index.js remember "Production Hetzner'da Coolify ile deploy ediliyor." --scope workspace
+node --env-file=.env packages/cli/dist/index.js recall "production nerede barınıyor?"
+node --env-file=.env packages/cli/dist/index.js context
 ```
 
 > Model ilk kullanımda bir kez indirilir (CPU-dostu bge-small). Sonrasında recall yerel ve anlıktır.
@@ -114,13 +118,16 @@ dolores init                      # DB kurulumu: extension, migration, RLS, pg_c
 dolores remember "<metin>"        # bir anı ekle   (--scope, --importance, --source)
 dolores recall   "<sorgu>"        # hibrit vektör + full-text arama
 dolores context                   # system prompt'a inject edilecek minimal bağlam bloğu
+dolores ingest-status <jobId>      # kuyruktaki işi sorgula; script'ler için --json ekle
 dolores ingest   <dosya|stdin>    # bir konuşmadan fact + memory damıt (async)
 dolores facts    [--category …]   # yapısal fact'leri listele
-dolores prune    [--dry-run]      # manuel temizlik
+dolores prune    [--dry-run | --confirm] # varsayılan önizleme; --confirm uygular
 dolores status                    # daemon + DB sağlığı, sayılar, tahmini token tasarrufu
 ```
 
 `dolores context` öne çıkan komuttur: bir agent başlarken çalıştırın ve çıktısını system prompt'a pipe edin. Agent "kim olduğunu" minimal token'la öğrenir.
+
+Bağlam bütçesi başlık ve ayraçları da içerir; token tahmini `ceil(karakter sayısı / 4)` ile yapılır. Bu, paketleme yaklaşımıdır; sağlayıcının tokenizer'ı değildir. Yerel embedder hazır olmadan önce sonlu, 384 boyutlu çıktı ürettiğini doğrular; bilinmeyen veya uyumsuz modeller açık hata verir.
 
 ## MCP (Claude Code / Cursor)
 
@@ -153,13 +160,19 @@ Artık bellek pasif bir depo değil — agent'ın oturumlar boyunca aktif kullan
 | **Çelişki çözümü** | `ON CONFLICT` upsert (son yazan kazanır) | >0.9 cosine benzerlikte süpersede |
 | **Örnek** | `stack/db = Postgres + pgvector` | "geçen deploy'da migration sırası bug'ı çözüldü" |
 
-**İzolasyon.** Her satır `workspace_id` (+ opsiyonel `user_id`) taşır ve Postgres Row-Level Security ile korunur. Daemon non-superuser olarak bağlanır ve kiracıyı her transaction'da set eder; böylece kiracılar arası okuma imkânsızdır — yalnızca tavsiye edilmemiş değil.
+**İzolasyon ve kimlik.** Daemon non-superuser uygulama rolünü kullandığında RLS, her transaction'ı sağlanan workspace ve kullanıcıyla sınırlar. Kimlikler çağıran istemciden gelir: ortak Bearer token bağlantı erişimini denetler, kullanıcı hesabını bu kimliklere bağlamaz. Birbirine güvenmeyen kullanıcılara hizmet veren uygulama kendi sınırında kimlik doğrulamalı ve yetkili kimlikleri sağlamalıdır.
+
+Daemon açılışta runtime rolünün RLS'yi atlayamadığını ve `facts`, `memories`, `ingest_jobs` tablolarının RLS'yi zorunlu tuttuğunu denetler. Güvensiz bağlantı; model, worker veya HTTP dinleyicisi başlamadan reddedilir. Runtime için `DOLORES_APP_DATABASE_URL`, migration ve kuyruk bakımı için admin `DATABASE_URL` kullanın.
+
+Yeni yazımlarda `scope: "workspace"`, çağıranın kullanıcı kimliği olsa bile `user_id = NULL` olarak saklanır ve workspace ile paylaşılır. `scope: "personal"` kullanıcı kimliği gerektirir. Scope verilmezse kimliği olan çağıran için personal, diğer durumda workspace seçilir. CLI, MCP, core API, fact ve memory yazımları aynı kuralı izler. Önceden kullanıcıya bağlı kayıtların sahipliği korunur; güncelleme eski verileri paylaşılabilir hale getirmez. Yakın kopya eşleştirme ve consolidation fiziksel sahipliği korur.
 
 **Decay.** Günlük bir `pg_cron` işi, eski ve geri çağrılmayan anıların önemini yumuşatır — insan belleği gibi. Silme **varsayılan kapalıdır** (`DOLORES_DECAY_MODE=conservative`); agresif silme politikası opt-in'dir.
 
+Decay modunu değiştirdikten sonra `dolores init --no-docker` komutunu yeniden çalıştırın: muhafazakâr kurulum, önceden planlanmış agresif işi kaldırır. Temizlik, sürüm geçmişindeki başka bir kaydın işaret ettiği anıları korur. Doğrudan `POST /prune` isteğinde `dryRun` verilmezse önizleme yapılır; uygulamak için `dryRun: false` gönderin. CLI varsayılan olarak önizleme yapar; uygulamak için `--confirm` gerekir.
+
 ## Nereye Oturur
 
-Mem0, Letta (eski MemGPT) ve Zep'in hepsi Postgres/vektör tabanlı agent belleği yapar — kavram kanıtlanmıştır. dolores'in niş'i: **self-hosted, ücretsiz yerel embedding, MCP-native, ham transkript saklamaz, KVKK/GDPR-temiz.** Aboneliğiniz, veritabanınız, başka hiçbir şey.
+Mem0, Letta (eski MemGPT) ve Zep'in hepsi Postgres/vektör tabanlı agent belleği yapar — kavram kanıtlanmıştır. dolores'in niş'i: **self-hosted, varsayılan yerel embedding, MCP-native ve damıtılmış uzun süreli bellek.** Harici API sağlayıcılarını açıp açmamayı siz seçersiniz; veri işleme ve uyumluluk bu kurulum tercihine bağlıdır. Async ingest ham girdiyi iş bitene veya deneme hakkı tükenene kadar geçici olarak Postgres kuyruğunda tutar.
 
 ## Tech Stack
 

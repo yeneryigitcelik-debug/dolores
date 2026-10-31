@@ -459,6 +459,41 @@ describe("Error response schema", () => {
     await pool.end().catch(() => undefined);
   });
 
+  it("accepts legacy GUID ids past validation on ingest routes", async () => {
+    const workspaceId = "00000000-0000-0000-0000-000000000001";
+    const userId = "11111111-1111-1111-1111-111111111111";
+    const cases: ReadonlyArray<{
+      url: string;
+      body: Record<string, string>;
+      status: number;
+      code: string;
+    }> = [
+      {
+        url: "/ingest",
+        body: { workspaceId, userId, text: "GUID compatibility" },
+        status: 503,
+        code: "EXTRACTION_UNAVAILABLE",
+      },
+      {
+        url: "/ingest/status",
+        body: { workspaceId, userId, jobId: "00000000-0000-0000-0000-000000000002" },
+        status: 500,
+        code: "INTERNAL",
+      },
+    ];
+    for (const tc of cases) {
+      const res = await app.inject({
+        method: "POST",
+        url: tc.url,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(tc.body),
+      });
+      expect(res.statusCode).toBe(tc.status);
+      const parsed = JSON.parse(res.body) as { error: { code: string } };
+      expect(parsed.error.code).toBe(tc.code);
+    }
+  });
+
   it("400 validation errors have {error:{code,message,issues}} shape", async () => {
     const res = await app.inject({
       method: "POST",
@@ -473,6 +508,60 @@ describe("Error response schema", () => {
     expect(body.error.code).toBe("VALIDATION_ERROR");
     expect(typeof body.error.message).toBe("string");
     expect(Array.isArray(body.error.issues)).toBe(true);
+  });
+
+  it("/remember rejects scope personal with missing or null userId before touching the database", async () => {
+    // The pool points at a dead PostgreSQL port, so a 400 (not a 500) proves validation runs before persistence.
+    for (const userId of [undefined, null]) {
+      // JSON.stringify drops undefined properties, which covers the "missing userId" case.
+      const body = {
+        workspaceId: TEST_WORKSPACE_ID,
+        content: "regression test memory content",
+        scope: "personal",
+        userId,
+      };
+      const res = await app.inject({
+        method: "POST",
+        url: "/remember",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify(body),
+      });
+      expect(res.statusCode).toBe(400);
+      const json = res.json() as {
+        error: { code: string; issues: Array<{ path: Array<string | number> }> };
+      };
+      expect(json.error.code).toBe("VALIDATION_ERROR");
+      expect(Array.isArray(json.error.issues)).toBe(true);
+      expect(json.error.issues.some((issue) => issue.path.includes("userId"))).toBe(true);
+    }
+  });
+
+  it("/facts/upsert rejects scope personal with missing or null userId before touching the database", async () => {
+    // The pool points at a dead PostgreSQL port, so a 400 (not a 500) proves validation runs before persistence.
+    for (const userId of [undefined, null]) {
+      // JSON.stringify drops undefined properties, which covers the "missing userId" case.
+      const body = {
+        workspaceId: TEST_WORKSPACE_ID,
+        category: "preferences",
+        key: "editor",
+        value: "vim",
+        scope: "personal",
+        userId,
+      };
+      const res = await app.inject({
+        method: "POST",
+        url: "/facts/upsert",
+        headers: { "content-type": "application/json" },
+        payload: JSON.stringify(body),
+      });
+      expect(res.statusCode).toBe(400);
+      const json = res.json() as {
+        error: { code: string; issues: Array<{ path: Array<string | number> }> };
+      };
+      expect(json.error.code).toBe("VALIDATION_ERROR");
+      expect(Array.isArray(json.error.issues)).toBe(true);
+      expect(json.error.issues.some((issue) => issue.path.includes("userId"))).toBe(true);
+    }
   });
 
   it("500 errors return INTERNAL code without pg connection details", async () => {
@@ -506,19 +595,30 @@ describe.skipIf(!HAS_DB)("POST /ingest → 202 + jobId, /ingest/status", () => {
 
   beforeAll(async () => {
     pool = new Pool({ connectionString: DB_URL });
+    await withTenant(pool, { workspaceId: TEST_WORKSPACE_ID, userId: TEST_USER_ID }, (c) =>
+      c.query("DELETE FROM ingest_jobs WHERE workspace_id = $1", [TEST_WORKSPACE_ID]),
+    );
     const embedder = new NoOpEmbedder();
     await embedder.ready();
     // createApp does NOT start the ingest worker, so jobs stay 'pending' here —
     // which is exactly what lets us assert the enqueued state deterministically.
-    app = await createApp(pool, embedder, cfg);
+    // Extraction enabled + injected fake provider (never called) so /ingest accepts.
+    const fakeProvider = { id: "fake", complete: async () => '{"facts":[],"memories":[]}' };
+    app = await createApp(
+      pool,
+      embedder,
+      { ...cfg, extractionEnabled: true },
+      undefined,
+      fakeProvider,
+    );
     await app.ready();
   });
 
   afterAll(async () => {
     // Clean up the pending jobs this suite enqueued (no worker drained them).
-    await withTenant(pool, { workspaceId: TEST_WORKSPACE_ID }, (c) =>
+    await withTenant(pool, { workspaceId: TEST_WORKSPACE_ID, userId: TEST_USER_ID }, (c) =>
       c.query("DELETE FROM ingest_jobs WHERE workspace_id = $1", [TEST_WORKSPACE_ID]),
-    ).catch(() => undefined);
+    );
     await app.close();
     await pool.end().catch(() => undefined);
   });
@@ -569,6 +669,83 @@ describe.skipIf(!HAS_DB)("POST /ingest → 202 + jobId, /ingest/status", () => {
       }),
     });
     expect(res.statusCode).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Suite: /ingest refuses when extraction is unavailable (dead pool — proves the
+// 503 short-circuits BEFORE any DB write; an enqueue attempt would 500).
+// ---------------------------------------------------------------------------
+
+describe("POST /ingest — extraction unavailable", () => {
+  let pool: Pool;
+  const embedder = new NoOpEmbedder();
+  const body = JSON.stringify({
+    workspaceId: TEST_WORKSPACE_ID,
+    userId: TEST_USER_ID,
+    text: "please distil this",
+  });
+
+  beforeAll(async () => {
+    pool = new Pool({ connectionString: "postgresql://noop:noop@localhost:1/noop" });
+    await embedder.ready();
+  });
+
+  afterAll(async () => {
+    await pool.end().catch(() => undefined);
+  });
+
+  it("returns 503 EXTRACTION_UNAVAILABLE when extraction is disabled", async () => {
+    const app = await createApp(pool, embedder, cfg);
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/ingest",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      expect(res.statusCode).toBe(503);
+      const parsed = JSON.parse(res.body) as { error: { code: string } };
+      expect(parsed.error.code).toBe("EXTRACTION_UNAVAILABLE");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns 503 when enabled but the provider is explicitly null", async () => {
+    const app = await createApp(
+      pool,
+      embedder,
+      { ...cfg, extractionEnabled: true },
+      undefined,
+      null,
+    );
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/ingest",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      expect(res.statusCode).toBe(503);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("still validates the body first (400 beats 503)", async () => {
+    const app = await createApp(pool, embedder, cfg);
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/ingest",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ workspaceId: "not-a-uuid", text: "" }),
+      });
+      expect(res.statusCode).toBe(400);
+    } finally {
+      await app.close();
+    }
   });
 });
 

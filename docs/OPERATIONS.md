@@ -66,6 +66,12 @@ dolores uses `pg_cron` to run a nightly decay job that softens the importance of
 
 Aggressive delete is explicitly opt-in to prevent accidental data loss. Set it only when running dolores as a short-session scratchpad rather than a long-term memory store.
 
+After changing `DOLORES_DECAY_MODE`, re-run `dolores init --no-docker`. Conservative initialization unschedules the existing `memory-decay` job for the current database only; it preserves the softening and queue-maintenance jobs. Changing the daemon environment alone does not remove an already scheduled database job.
+
+Both aggressive cron cleanup and manual pruning retain a row referenced by another memory's `superseded_by`. This prevents deleting a terminal version from clearing that link and making older history appear active again. Consequently some old version chains remain intentionally retained.
+
+`POST /prune` defaults to `dryRun: true` when omitted. A preview includes rows whose importance would fall from 3 to 2 before the aggressive deletion step. Set `dryRun: false` explicitly to apply; CLI `prune` previews by default and requires `--confirm` to apply. Pruning also includes explicit workspace/user predicates in addition to RLS.
+
 ---
 
 ## Memory Evolution (temporal history)
@@ -86,7 +92,7 @@ curl -s localhost:4505/recall -d '{"workspaceId":"…","query":"hosting provider
 curl -s localhost:4505/recall -d '{"workspaceId":"…","query":"hosting provider","asOf":"2026-05-01"}'
 ```
 
-Default recall and the static `/context` blob always show the **active** set only; superseded rows never leak into normal retrieval. The required columns are added automatically by `applyMigrations()` (idempotent) — no manual migration step. If you run `versioned`, monitor table growth and rely on `prune` / decay for cleanup of old superseded rows.
+Default recall and the static `/context` blob always show the **active** set only; superseded rows never leak into normal retrieval. The required columns are added automatically by `applyMigrations()` (idempotent) — no manual migration step. If you run `versioned`, monitor table growth: `prune` / decay remove eligible unreferenced rows but retain version-history targets.
 
 ---
 
@@ -108,7 +114,7 @@ How it works: it pulls active, embedded memories, clusters them by cosine simila
 
 ## Observability (EPIC K)
 
-The daemon exposes in-memory request metrics — no external egress (KVKK-clean):
+The daemon exposes in-memory request metrics — no external metrics exporter:
 
 - **`GET /metrics`** (JSON): uptime, total requests, `dedupRate`, per-route
   `count` / `avgMs` / `p50Ms` / `p95Ms` / `p99Ms` / `errors4xx` / `errors5xx`, DB
@@ -144,7 +150,13 @@ Lifecycle: `pending → running → done | failed`. A failed attempt is retried 
 
 **Privacy (rule 1):** `payload` (the raw text) is a transient work buffer — it is set `NULL` the instant a job reaches a terminal state (`done`/`failed`). dolores never becomes a chat-log store. A nightly `pg_cron` job (`ingest-jobs-purge`) deletes terminal job rows older than 7 days.
 
-**Concurrency & recovery:** workers claim jobs with `FOR UPDATE SKIP LOCKED` (a SECURITY DEFINER function, like the decay jobs — the worker is tenant-agnostic; per-tenant writes still run under RLS). Set `DOLORES_INGEST_WORKERS` > 1 to parallelise. On startup the worker reclaims any job stuck in `running` from a crashed run (back to `pending`). Assumes a single daemon owns the queue (architecture rule 4).
+**Concurrency & recovery:** workers claim jobs with `FOR UPDATE SKIP LOCKED` (a SECURITY DEFINER function, like the decay jobs — the worker is tenant-agnostic; per-tenant writes still run under RLS). Set `DOLORES_INGEST_WORKERS` > 1 to parallelise. Workers renew a running job's lease with a heartbeat. Startup and periodic recovery reclaim only expired leases (default 5 minutes); starting another worker does not reset active jobs. Completion/failure updates are fenced by the claimed attempt. Delivery is **at least once**: a crash can repeat a provider call or a partially persisted extraction; consumers must not assume exactly-once billing or processing.
+
+`/ingest` returns **503** when extraction is disabled or no provider is configured, before creating a job. Existing pending jobs remain pending while the worker is paused. Provider failures, invalid JSON and schema-invalid extraction responses retry with backoff instead of being acknowledged as an empty success. An intentional valid empty extraction can complete normally.
+
+Custom extraction providers must honor the optional `AbortSignal` to cancel remote work at the deadline; built-in SDK providers propagate it. The caller still returns on time if a custom provider ignores cancellation, but that remote work may continue.
+
+**Upgrade existing databases:** retain the configured admin URL and `DOLORES_APP_PASSWORD`, then run `dolores init --no-docker` to install the safe expired-lease SQL function before restarting the daemon. Without the new function recovery fails closed and logs the upgrade instruction; it never falls back to the old reset-all function. No columns or historical memory ownership are changed. Fastembed 2.1 uses a new model-cache subdirectory; the first local-embedder start after upgrading may download its model again unless that cache is already populated.
 
 ---
 
@@ -174,6 +186,8 @@ Then set `DOLORES_VECTOR_INDEX=hnsw` so recall uses `hnsw.ef_search`. Benchmark 
 
 ## Daemon Environment Variables
 
+Startup inspects the runtime connection before loading the embedder, starting workers, or listening. The role must be neither superuser nor `BYPASSRLS`; `facts`, `memories`, and `ingest_jobs` must have RLS enabled and forced. Run `dolores init --no-docker` with the admin URL to install the schema, and configure the app URL separately. The admin connection may remain available for queue maintenance; it is never the tenant operation pool. Pool connection errors are handled without logging connection URLs, and a failed startup drains acquired resources before exiting.
+
 | Variable | Default | Description |
 |---|---|---|
 | `DATABASE_URL` | — | Postgres superuser URL (used by `dolores init`) |
@@ -182,7 +196,7 @@ Then set `DOLORES_VECTOR_INDEX=hnsw` so recall uses `hnsw.ef_search`. Benchmark 
 | `DOLORES_DAEMON_PORT` | `4505` | Port the daemon listens on (localhost only) |
 | `DOLORES_LOG_LEVEL` | `info` | Fastify log level (`trace` / `debug` / `info` / `warn` / `error`) |
 | `DOLORES_EMBED_MODEL` | `bge-small-en-v1.5` | fastembed model name (`bge-small-en-v1.5` = 384d CPU) |
-| `DOLORES_MODEL_CACHE` | `~/.dolores-models` | Where fastembed stores downloaded model weights |
+| `DOLORES_MODEL_CACHE` | `.dolores-models` (working directory) | Where fastembed stores downloaded model weights |
 | `DOLORES_VECTOR_INDEX` | `ivfflat` | Vector index access method: `ivfflat` (default) or `hnsw` (pgvector ≥0.5). See Vector Index below |
 | `DOLORES_IVFFLAT_PROBES` | `10` | `ivfflat.probes` for pgvector ANN searches (higher = more accurate, slower) |
 | `DOLORES_HNSW_EF_SEARCH` | `40` | `hnsw.ef_search` when `DOLORES_VECTOR_INDEX=hnsw` (higher = more accurate, slower) |
@@ -195,12 +209,17 @@ Then set `DOLORES_VECTOR_INDEX=hnsw` so recall uses `hnsw.ef_search`. Benchmark 
 | `DOLORES_EXTRACTION_MODEL` | — | LLM model ID used for async fact extraction (`ingest` command) |
 | `DOLORES_INGEST_WORKERS` | `1` | Concurrent ingest worker loops draining the durable queue |
 | `DOLORES_INGEST_POLL_MS` | `1000` | Worker idle poll interval (ms) |
-| `DOLORES_INGEST_MAX_ATTEMPTS` | `3` | Retries (exponential backoff) before a job is marked `failed` |
+| `DOLORES_INGEST_MAX_ATTEMPTS` | `3` | Total attempts, including the first, before terminal failure |
+| `DOLORES_INGEST_BASE_BACKOFF_MS` | `2000` | Base delay for exponential retry backoff |
+| `DOLORES_INGEST_LEASE_MS` | `300000` | Running lease lifetime, minimum 60000 ms |
+| `DOLORES_INGEST_HEARTBEAT_MS` | `30000` | Renewal interval, capped at half the lease and at 30000 ms for mixed worker configurations |
+| `DOLORES_INGEST_RECLAIM_MS` | `60000` | Expired-lease recovery interval, minimum 1000 ms |
+| `DOLORES_REQUEST_TIMEOUT_MS` | `60000` | CLI/MCP deadline including response body; maximum 3600000 ms |
 | `DOLORES_EXTRACTION_MIN_CONFIDENCE` | `0` | Drop extracted items whose model-reported confidence is below this (0..1); confidence-less items always kept |
 | `DOLORES_EXTRACTION_MAX_FACTS` | `20` | Maximum facts extracted per `ingest` call |
-| `DOLORES_EXTRACTION_TIMEOUT_MS` | `30000` | Timeout for a single extraction LLM call (ms) |
-| `WORKSPACE_ID` | — | Default workspace UUID for CLI operations |
-| `USER_ID` | — | Optional user UUID for per-user memory isolation |
+| `DOLORES_EXTRACTION_TIMEOUT_MS` | `30000` | Extraction deadline (ms), clamped to 300000; timed-out durable jobs retry |
+| `DOLORES_WORKSPACE_ID` | — | Default workspace UUID for CLI operations |
+| `DOLORES_USER_ID` | — | Optional user UUID for per-user memory isolation |
 
 ---
 
@@ -226,7 +245,7 @@ Set `DOLORES_AUTH_TOKEN` to a long random secret (32+ hex chars). Without it the
 openssl rand -hex 32  # generate a token
 ```
 
-Export it in `.env` (not committed) and reference it in your reverse proxy or MCP config.
+Export it in `.env` (not committed) and set the same `DOLORES_AUTH_TOKEN` for CLI/MCP clients. The clients send it on GET and POST requests. This shared transport secret does not authenticate caller-supplied workspace/user IDs; authorize those identities in the integrating application.
 
 ### Postgres port — localhost bind
 

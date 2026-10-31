@@ -2,7 +2,7 @@
 
 # dolores
 
-**Memory for AI agents that recalls only what matters — your Postgres, your data, zero per-token cost.**
+**Memory for AI agents that recalls only what matters — your Postgres, your data, local embeddings by default.**
 
 [![CI](https://github.com/yeneryigitcelik-debug/dolores/actions/workflows/ci.yml/badge.svg)](https://github.com/yeneryigitcelik-debug/dolores/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -27,7 +27,7 @@ The common approach to agent memory — dump everything into a Markdown file and
 
 **dolores stores knowledge in Postgres and retrieves only what's *relevant* to the current message (~600 tokens).** Whether you have 200 memories or 2,000, only the most relevant few ever enter the context. **The win grows as the memory grows.**
 
-The only thing you pay for is the LLM subscription you already have (Claude Pro/Max, etc.). Embeddings run locally and for free. Your data never leaves your infrastructure.
+The default local embedder runs on your CPU without per-token API charges. Optional OpenAI embeddings and Anthropic/OpenAI extraction or consolidation send the selected content to those providers and incur their API charges; a chat subscription does not include API usage. Local model weights download on first use.
 
 ## Benchmarks
 
@@ -60,10 +60,10 @@ Hybrid retrieval is **2.6× better than full-text alone**. Full-text handles exa
 - 🧠 **Two memory kinds** — structured **facts** (deterministic key/value, exact SQL) and semantic **memories** (free text, vector similarity).
 - 🔍 **Hybrid retrieval** — pgvector cosine **+** Postgres full-text, fused with Reciprocal Rank Fusion. Falls back to pure full-text in "lite mode".
 - 🆓 **Free local embeddings by default** — `fastembed` (bge-small, 384d) on CPU. Swap in OpenAI, or run embedding-free with the `noop` embedder.
-- 🏢 **Multi-tenant with Row-Level Security** — personal + workspace scopes, isolated at the database level. Safe for teams.
+- 🏢 **Multi-tenant with Row-Level Security** — personal + workspace scopes enforced for the supplied tenant context. See the identity boundary below.
 - 🔌 **First-class MCP** — exposes `remember` / `recall` tools so Claude Code & Cursor save and recall context *by themselves*.
 - 🧹 **Self-maintaining** — `pg_cron` decays stale memories inside the database. Conservative by default (softens, never deletes); aggressive delete is opt-in.
-- 🗑️ **No raw transcripts** — only distilled facts and memories are stored. Garbage in, garbage out — so we don't store garbage.
+- 🗑️ **No raw transcripts** — the durable memory store contains distilled facts and memories. Async ingest temporarily buffers raw input in Postgres until the job completes or exhausts its retries.
 - 🐘 **One source of truth** — Postgres. CLI, MCP, and scheduled jobs all read the same database; ACID handles the conflicts.
 
 ## Architecture
@@ -88,7 +88,7 @@ Or run from source (see below).
 
 ## Quick start
 
-**Requirements:** Node ≥ 20, pnpm, Docker.
+**Requirements:** Node ≥ 20.6 (or Node 22), pnpm, Docker.
 
 ```bash
 git clone https://github.com/yeneryigitcelik-debug/dolores.git
@@ -98,11 +98,15 @@ cp .env.example .env          # tweak if you like
 
 pnpm db:up                    # Postgres + pgvector + pg_cron
 pnpm build
-dolores init                  # extensions, schema, RLS, decay job
+node --env-file=.env packages/cli/dist/index.js init --no-docker
 
-dolores remember "We deploy production on Hetzner with Coolify." --scope workspace
-dolores recall  "where is production hosted?"
-dolores context               # minimal-token memory blob for a system prompt
+# Start the daemon in a second terminal from the same directory:
+node --env-file=.env packages/daemon/dist/index.js
+
+# Once the daemon is ready, run in the first terminal:
+node --env-file=.env packages/cli/dist/index.js remember "We deploy production on Hetzner with Coolify." --scope workspace
+node --env-file=.env packages/cli/dist/index.js recall "where is production hosted?"
+node --env-file=.env packages/cli/dist/index.js context
 ```
 
 > The model downloads once on first use (~CPU-friendly bge-small). After that, recall is local and instant.
@@ -114,13 +118,16 @@ dolores init                      # DB setup: extensions, migration, RLS, pg_cro
 dolores remember "<text>"         # add a memory   (--scope, --importance, --source)
 dolores recall   "<query>"        # hybrid vector + full-text search
 dolores context                   # minimal context blob to inject into a system prompt
+dolores ingest-status <jobId>      # inspect a queued job; add --json for scripts
 dolores ingest   <file|stdin>     # distill facts + memories from a conversation (async)
 dolores facts    [--category …]   # list structured facts
-dolores prune    [--dry-run]      # manual cleanup
+dolores prune    [--dry-run | --confirm] # preview by default; --confirm applies cleanup
 dolores status                    # daemon + DB health, counts, estimated token savings
 ```
 
 `dolores context` is the killer command: run it when an agent starts and pipe its output into the system prompt. The agent learns "who it is" for minimal tokens.
+
+The context budget includes headings and separators and uses `ceil(characters / 4)` as its token estimate. This is a packing heuristic, not a provider tokenizer. The local embedder validates finite 384-dimensional output before becoming ready; unknown or incompatible models fail explicitly.
 
 ## MCP (Claude Code / Cursor)
 
@@ -153,13 +160,19 @@ Now memory is not a passive store — it's a tool the agent actively uses across
 | **Conflict resolution** | `ON CONFLICT` upsert (last writer wins) | supersede on >0.9 cosine similarity |
 | **Example** | `stack/db = Postgres + pgvector` | "migration ordering bug fixed last deploy" |
 
-**Isolation.** Every row carries `workspace_id` (+ optional `user_id`) and is guarded by Postgres Row-Level Security. The daemon connects as a non-superuser and sets the tenant per transaction, so cross-tenant reads are impossible — not just discouraged.
+**Isolation and identity.** RLS restricts each transaction to its supplied workspace and user when the daemon uses the non-superuser app role. The daemon trusts caller-supplied IDs: a shared Bearer token controls transport access and does not bind a caller to an account. An application serving mutually untrusted users must authenticate them and supply authorized IDs at its boundary.
+
+Daemon startup checks that its runtime role cannot bypass RLS and that `facts`, `memories`, and `ingest_jobs` enforce it. An unsafe connection fails before model loading, workers, or HTTP listening. Use `DOLORES_APP_DATABASE_URL` for runtime and keep the admin `DATABASE_URL` for migrations and queue maintenance.
+
+For new writes, `scope: "workspace"` stores `user_id = NULL` and is shared with the workspace, including when the caller has a user ID. `scope: "personal"` requires a user ID. Omitting scope selects personal for an identified caller and workspace otherwise. CLI, MCP, direct core calls, facts and memories follow this rule. Existing owner-bound records retain their ownership; this upgrade does not declassify old data. Near-duplicate matching and consolidation respect physical ownership.
 
 **Decay.** A daily `pg_cron` job softens the importance of stale, un-recalled memories — like human memory. Deletion is **off by default** (`DOLORES_DECAY_MODE=conservative`); the aggressive delete policy is opt-in.
 
+Re-run `dolores init --no-docker` after changing decay mode: conservative initialization removes a previously scheduled aggressive job. Cleanup retains any memory referenced by version history. Direct `POST /prune` requests default to a preview when `dryRun` is omitted; pass `dryRun: false` to apply. The CLI previews by default and requires `--confirm` to apply.
+
 ## Where it fits
 
-Mem0, Letta (ex-MemGPT), and Zep all do Postgres/vector agent memory — the concept is proven. dolores's niche: **self-hosted, free local embeddings, MCP-native, no raw-transcript storage, KVKK/GDPR-clean.** Your subscription, your database, nothing else.
+Mem0, Letta (ex-MemGPT), and Zep all do Postgres/vector agent memory — the concept is proven. dolores's niche: **self-hosted, local embeddings by default, MCP-native, and distilled long-term memory.** You choose whether to enable external API providers; data handling and compliance depend on that deployment choice.
 
 ## Tech stack
 

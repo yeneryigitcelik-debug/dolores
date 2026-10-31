@@ -12,5 +12,6 @@ const config = loadConfig();
 
 startDaemon(config).catch((err: unknown) => {
   console.error("[dolores-daemon] fatal startup error:", err instanceof Error ? err.message : err);
-  process.exit(1);
+  // startDaemon has drained its resources; allow native runtimes to exit safely.
+  process.exitCode = 1;
 });

@@ -16,7 +16,9 @@
   "author": "Yener Yiğit Çelik",
   "license": "MIT",
   "files": ["dist", "README.md"],
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "dolores": "./dist/index.js"
   },
@@ -30,7 +32,7 @@
     "@dolores/core": "workspace:*",
     "@dolores/db": "workspace:*",
     "commander": "^13.0.0",
-    "zod": "^3.24.1"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

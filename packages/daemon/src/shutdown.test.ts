@@ -18,14 +18,17 @@ import { describe, expect, it } from "vitest";
  * This only reproduces with the LOCAL embedder (NoOp can't crash), so the test
  * spawns the BUILT daemon with DOLORES_EMBEDDER=local. It needs the model cached
  * offline + a current dist build; it self-skips otherwise so CI without the
- * model never flakes. No DB is required: the daemon boots/listens lazily and
- * neither /health nor shutdown touch Postgres.
+ * model never flakes. A disposable application-role DB is also required: production startup now
+ * verifies the role and RLS before listening. /health itself stays DB-free.
  */
 
 const DIST_ENTRY = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 const MODEL_CACHE = fileURLToPath(new URL("../.dolores-models", import.meta.url));
 
-const CAN_RUN = existsSync(DIST_ENTRY) && existsSync(MODEL_CACHE);
+const CAN_RUN =
+  existsSync(DIST_ENTRY) &&
+  existsSync(MODEL_CACHE) &&
+  Boolean(process.env.DOLORES_APP_DATABASE_URL);
 
 interface ShutdownOutcome {
   code: number | null;
@@ -44,7 +47,7 @@ async function bootThenSignal(signal: "SIGTERM" | "SIGINT"): Promise<ShutdownOut
       DOLORES_EMBED_MODEL: "bge-small-en-v1.5",
       DOLORES_DAEMON_PORT: String(port),
       DOLORES_DAEMON_HOST: "127.0.0.1",
-      // Pool is lazy; a dummy URL is enough since nothing queries during the test.
+      // Use the explicitly configured synthetic app role for the startup preflight.
       DATABASE_URL:
         process.env.DOLORES_APP_DATABASE_URL ??
         process.env.DATABASE_URL ??
