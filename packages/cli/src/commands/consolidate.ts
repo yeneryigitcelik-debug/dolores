@@ -1,6 +1,15 @@
 import type { ConsolidateRequest, ConsolidateResponse, Scope } from "@dolores/core";
+import { z } from "zod";
 import { DaemonError, daemonPost } from "../client.js";
 import { getConfig, memoryContext } from "../config.js";
+
+const consolidateResponseSchema = z.object({
+  enabled: z.boolean(),
+  candidates: z.number().int().nonnegative(),
+  clusters: z.number().int().nonnegative(),
+  consolidated: z.number().int().nonnegative(),
+  superseded: z.number().int().nonnegative(),
+}) satisfies z.ZodType<ConsolidateResponse>;
 
 export async function runConsolidate(opts: { scope?: string }): Promise<void> {
   const config = getConfig();
@@ -14,6 +23,7 @@ export async function runConsolidate(opts: { scope?: string }): Promise<void> {
       config,
       "/consolidate",
       body,
+      consolidateResponseSchema,
     );
     if (!res.enabled) {
       console.log(

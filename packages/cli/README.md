@@ -30,6 +30,8 @@ Bearer token daemon bağlantısına erişimi sınırlar. `DOLORES_WORKSPACE_ID` 
 
 Örnek IPv6 bağlantısı: `DOLORES_DAEMON_HOST=::1 dolores status`.
 
+Yazma komutları (`remember`, `ingest`, `prune`, `consolidate`) daemon onayını doğrular. `remember` boş olmayan bir string kimlik ve boolean `deduped` bekler. Kimlik UUID olmak zorunda değildir ve baştaki/sondaki boşluklar dahil olduğu gibi gösterilir. `ingest` boolean `queued` bekler. `jobId` isteğe bağlıdır (eski sürümler göndermeyebilir), ama gönderilirse boş olamaz. `queued:false` gelirse komut başarısız sayılır. `prune` daemon'un bildirdiği modun (`dryRun`) istenen modla aynı olmasını şart koşar. `consolidate` boolean `enabled` ve dört negatif olmayan tam sayı sayacı (`candidates`, `clusters`, `consolidated`, `superseded`) bekler; kapalı daemon geçerli bir no-op yanıtında dört sayacı sıfır döndürür. Onay doğrulanamazsa CLI hiçbir başarı çıktısı vermez ve 1 koduyla çıkar. İstek otomatik tekrarlanmaz. Bu durum işlemin gerçekleşmediği anlamına gelmez; yeniden göndermeden önce sonucu elle kontrol et.
+
 Uzun süren `consolidate` gibi işler için süre sınırı artırılabilir. Zaman aşımında CLI isteği kendiliğinden tekrarlamaz; daemon işlemi tamamlamış olabileceğinden bir yazma isteğini yeniden göndermeden önce sonucu kontrol et. Token hata mesajlarından gizlenir ve URL'ye eklenmez.
 
 → See the [root README](https://github.com/yeneryigitcelik-debug/dolores#readme) for full documentation and quick start.

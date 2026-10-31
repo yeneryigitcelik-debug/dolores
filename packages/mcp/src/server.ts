@@ -203,7 +203,13 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 function isRememberResponse(v: unknown): v is RememberResponse {
-  return isRecord(v) && typeof v.id === "string" && typeof v.deduped === "boolean";
+  // Kimlik boş olmamalı; değer değiştirilmeden korunur.
+  return (
+    isRecord(v) &&
+    typeof v.id === "string" &&
+    v.id.trim().length > 0 &&
+    typeof v.deduped === "boolean"
+  );
 }
 
 function isRecallResponse(v: unknown): v is RecallResponse {
@@ -300,7 +306,9 @@ export function createServer(config: McpConfig = loadMcpConfig()): McpServer {
       }
 
       if (!isRememberResponse(res)) {
-        return errorResult("daemon beklenmeyen yanıt biçimi döndürdü");
+        return errorResult(
+          "daemon beklenmeyen yanıt biçimi döndürdü. Kaydetme sonucu doğrulanamadı; istek tekrarlanmadı. Yeniden göndermeden önce hafızayı kontrol et.",
+        );
       }
 
       const detail = res.deduped ? " (mevcut hafıza güncellendi)" : "";

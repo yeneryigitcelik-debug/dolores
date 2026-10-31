@@ -14,6 +14,15 @@ const pruneResponseSchema = z.object({
   dryRun: z.boolean(),
 }) satisfies z.ZodType<PruneResponse>;
 
+// Daemon'un bildirdiği mod istenen modla aynı olmalı; aksi halde hiçbir sayı başarı olarak yazılmaz.
+function assertPruneMode(res: PruneResponse, body: PruneRequest): void {
+  if (res.dryRun !== body.dryRun) {
+    throw new DaemonError(
+      "Daemon beklenen prune modunu doğrulamadı. İşlem sonucu belirsiz; istek tekrarlanmadı. Yeniden çalıştırmadan önce durumu kontrol et.",
+    );
+  }
+}
+
 export async function runPrune(opts: PruneOptions): Promise<void> {
   const config = getConfig();
   const ctx = memoryContext(config);
@@ -35,6 +44,7 @@ export async function runPrune(opts: PruneOptions): Promise<void> {
         body,
         pruneResponseSchema,
       );
+      assertPruneMode(res, body);
 
       console.log("Prune tamamlandı:");
       console.log(`  Silindi:       ${res.deleted}`);
@@ -48,6 +58,7 @@ export async function runPrune(opts: PruneOptions): Promise<void> {
         body,
         pruneResponseSchema,
       );
+      assertPruneMode(res, body);
 
       if (opts.dryRun) {
         console.log("Prune önizlemesi [DRY RUN — gerçek silme yok]:");

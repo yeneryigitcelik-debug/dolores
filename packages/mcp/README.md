@@ -49,7 +49,7 @@ content: string      – kaydedilecek bilgi (zorunlu)
 scope?: "personal" | "workspace"   – kullanıcı belirtilmişse personal, aksi halde workspace
 importance?: 1-10   – varsayılan: 5
 ```
-Çıktı: `Kaydedildi (id: <uuid>)` veya dedup durumunda `(mevcut hafıza güncellendi)`.
+Çıktı: `Kaydedildi (id: <id>)`, dedup durumunda ise sonuna `(mevcut hafıza güncellendi)` eklenir. `<id>` boş olmayan herhangi bir string olabilir ve değiştirilmeden gösterilir. Daemon yanıtında boş olmayan bir kimlik ya da boolean `deduped` yoksa araç `isError: true` döner. Bu durumda istek tekrarlanmaz ve işlemin gerçekleşmediği de iddia edilmez; yeniden göndermeden önce hafızayı kontrol et.
 
 ### `recall`
 ```
